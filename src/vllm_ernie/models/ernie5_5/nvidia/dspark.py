@@ -1,12 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""DSpark draft model for ERNIE 5 (NVIDIA).
-
-Mirrors `vllm.models.deepseek_v4.nvidia.dspark`: three non-causal SWA-only
-mHC stages built from the target decoder layer, fed by the stream-averaged
-target hidden states of `dspark_target_layer_ids` and refined by a Markov
-head. The stages keep the trained compressed-YaRN RoPE of the HCA layers.
-"""
+"""DSpark draft model for ERNIE 5 (NVIDIA): SWA-only mHC stages + Markov head."""
 
 from collections.abc import Iterable
 
@@ -89,8 +83,7 @@ class Ernie5_5DSparkModel(nn.Module):
         )
         self.main_norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
 
-        # Past the target's main and MTP layers: no layer-name collisions, and
-        # the DeepSeek V4 attention treats them as uncompressed SWA layers.
+        # After all target layers: unique names, uncompressed SWA attention.
         self.layer_offset = (
             target_config.num_hidden_layers + target_config.num_nextn_predict_layers
         )

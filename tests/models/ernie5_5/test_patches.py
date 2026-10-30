@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""The plugin hooks reproduce the eblite-v1 changes to shared vLLM code."""
+"""Tests for the hooks that patch shared vLLM code for ERNIE 5.5."""
 
 import pickle
 from types import SimpleNamespace
@@ -72,7 +72,7 @@ def test_dspark_draft_keeps_own_config():
     config.architectures = ["Ernie5_5_MoeDSparkDraftModel"]
     assert SpeculativeConfig.hf_config_override(config).model_type == "ernie5_5_moe"
 
-    # State after the DeepSeek V4 DSpark rewrite in SpeculativeConfig.
+    # State after SpeculativeConfig rewrites the DSpark draft.
     verified = []
     draft = SimpleNamespace(
         architectures=["Ernie5_5_MoeDSparkDraftModel"],

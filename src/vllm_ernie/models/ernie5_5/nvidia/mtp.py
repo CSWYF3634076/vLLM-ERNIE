@@ -1,11 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""MTP draft model for ERNIE 5 (NVIDIA).
-
-Mirrors `vllm.models.deepseek_v4.nvidia.mtp`: separate ``e_proj``/``h_proj``,
-an mHC decoder block (a DSA layer in the released checkpoints) and the
-``hc_head`` + shared norm + multimax lm_head in ``compute_logits``.
-"""
+"""MTP draft model for ERNIE 5."""
 
 from collections.abc import Iterable
 

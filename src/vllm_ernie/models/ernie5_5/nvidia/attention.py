@@ -129,7 +129,7 @@ class Ernie5_5Compressor(DeepseekCompressor):
 
 
 class Ernie5_5HCAAttentionMixin:
-    """Adds the ERNIE 5 gate and VHA to a DeepSeek V4 attention class."""
+    """Adds the ERNIE 5 gate and VHA to an HCA attention class."""
 
     def __init__(self, vllm_config: VllmConfig, prefix: str, **kwargs) -> None:
         super().__init__(vllm_config, prefix, **kwargs)  # type: ignore[call-arg]
@@ -471,7 +471,7 @@ class Ernie5_5FlashMLASparseBackend(FlashMLASparseBackend):
 
 
 class Ernie5_5IndexerBackend(DeepseekV32IndexerBackend):
-    # Keeps the parent name: shared MLA code keys on "DEEPSEEK_V32_INDEXER".
+    # Keeps the parent name: shared MLA code keys on it.
 
     get_supported_kernel_block_sizes = staticmethod(_dsa_kernel_block_sizes)
 

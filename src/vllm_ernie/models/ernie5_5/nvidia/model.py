@@ -1,12 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""ERNIE 5 hybrid HCA/DSA model (NVIDIA).
-
-Built on the DeepSeek V4 mHC decoder (`vllm.models.deepseek_v4.nvidia.model`):
-HCA and DSA attention live in `.attention` and the latent MoE in `.moe`. The
-mHC mixer adds its RMS eps outside the sqrt throughout and the lm_head logits
-go through a learned multimax.
-"""
+"""ERNIE 5 hybrid HCA/DSA mHC decoder."""
 
 import typing
 from collections.abc import Callable, Iterable
@@ -281,7 +275,7 @@ class Ernie5_5Model(nn.Module, EagleModelMixin):
         self.rms_norm_eps = config.rms_norm_eps
         max_num_tokens = vllm_config.scheduler_config.max_num_batched_tokens
 
-        # One aux stream per non-default HCA input GEMM, as in DeepSeek V4.
+        # One aux stream per non-default HCA input GEMM.
         aux_stream_list = [torch.cuda.Stream() for _ in range(3)]
         # Shared by all DSA layers: the indexer output, and the sparse MLA
         # indices with the window appended. Not named `topk_indices_buffer`:

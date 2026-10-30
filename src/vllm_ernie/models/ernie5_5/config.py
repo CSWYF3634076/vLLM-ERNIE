@@ -6,14 +6,7 @@ from transformers import PretrainedConfig
 
 
 class Ernie5_5Config(PretrainedConfig):
-    """Config for ERNIE 5 hybrid MLA (`Ernie5_5_MoeForCausalLM`, `ernie5_5_moe`).
-
-    Layers with ``compress_ratios[i] > 1`` are DeepSeek-V4 style HCA layers
-    (top-level attention fields); layers with ``compress_ratios[i] <= 0`` are
-    DSA layers configured by the ``hybrid_mla_*`` fields. The trailing
-    ``num_nextn_predict_layers`` entries of ``compress_ratios`` describe the
-    MTP layers.
-    """
+    """Config for ERNIE 5 hybrid MLA (`Ernie5_5_MoeForCausalLM`, `ernie5_5_moe`)."""
 
     model_type = "ernie5_5_moe"
 

@@ -1,21 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""Hooks that reproduce the ERNIE 5.5 changes to shared vLLM code.
-
-Each hook mirrors one in-tree change on ``eblite-v1``:
-
-- ``_CONFIG_REGISTRY["ernie5_5_moe"] = Ernie5_5Config``
-- ``Ernie5_5_MoeForCausalLM`` / ``Ernie5_5MoeMTPModel`` use breakable CUDA
-  graphs
-- ``is_deepseek_mla`` covers ``ernie5_5_moe`` and ``ernie5_5_moe_mtp``;
-  ``ernie5_5_moe_mtp`` uses the DeepSeek MTP arch convertor
-- speculative config: ``ernie5_5_moe_mtp`` is an MTP model type, the target
-  config is rewritten to ``Ernie5_5MoeMTPModel`` for MTP, and the ERNIE DSpark
-  draft keeps its own config instead of the DeepSeek V4 DSpark rewrite
-- ``ernie5`` reasoning and tool-call parsers
-- ``MooncakeConnector`` sends the KV of a prefill whose one token is a stop
-  token (upstream vllm#63998)
-"""
+"""Hooks that patch shared vLLM code for ERNIE 5.5."""
 
 import functools
 import inspect
@@ -96,10 +81,7 @@ def _ernie5_hf_config_override(hf_config):
 
 
 def _undo_dspark_rewrite(spec_config) -> None:
-    # The DeepSeek V4 DSpark branch of __post_init__ rewrites every DSpark
-    # draft it does not know; undo it for the self-contained ERNIE draft.
-    # ``draft.architectures`` still holds the pre-rewrite value here since
-    # model_arch_config is only rebuilt by update_arch_.
+    # Restore the ERNIE DSpark draft config rewritten by __post_init__.
     draft = spec_config.draft_model_config
     if (
         spec_config.method == "dspark"
