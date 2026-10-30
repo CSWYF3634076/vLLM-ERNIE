@@ -16,6 +16,7 @@ from vllm.config import CacheConfig, VllmConfig, get_current_vllm_config
 from vllm.config.cache import CacheDType
 from vllm.distributed import get_tensor_model_parallel_world_size
 from vllm.forward_context import get_forward_context
+from vllm.logger import init_logger
 from vllm.model_executor.layers.attention import MLAAttention
 from vllm.model_executor.layers.layernorm import LayerNorm, RMSNorm
 from vllm.model_executor.layers.linear import (
@@ -28,10 +29,12 @@ from vllm.model_executor.layers.quantization import QuantizationConfig
 from vllm.model_executor.layers.quantization.utils.fp8_utils import (
     per_token_group_quant_fp8,
 )
+from vllm.model_executor.layers.quantization.utils.mxfp4_utils import downcast_to_mxfp
 from vllm.model_executor.layers.rotary_embedding import get_rope
 from vllm.model_executor.layers.sparse_attn_indexer import SparseAttnIndexer
 from vllm.model_executor.models.deepseek_v2 import DeepseekV32IndexerCache
 from vllm.models.deepseek_v4.attention import DeepseekV4Attention
+from vllm.models.deepseek_v4.common.ops.fused_indexer_q import MXFP4_BLOCK_SIZE
 from vllm.models.deepseek_v4.compressor import DeepseekCompressor
 from vllm.models.deepseek_v4.nvidia.flashinfer_sparse import (
     DeepseekV4FlashInferMLAAttention,
@@ -57,6 +60,7 @@ from vllm.v1.attention.backends.mla.indexer import (
     DeepseekV32IndexerBackend,
     DeepseekV32IndexerMetadata,
     DeepseekV32IndexerMetadataBuilder,
+    dsa_indexer_uses_fp4,
     get_max_prefill_buffer_size,
 )
 from vllm.v1.attention.ops.flashmla import (
@@ -68,6 +72,8 @@ from vllm.v1.kv_cache_layout import KVCacheLayout
 from vllm.v1.worker.workspace import current_workspace_manager
 
 from vllm_ernie.models.ernie5_5.config import Ernie5_5Config
+
+logger = init_logger(__name__)
 
 VHA_RANK = 16
 # FlashMLA sparse and the paged MQA logits kernels both use 64-token pages.
@@ -494,6 +500,38 @@ class Ernie5_5IndexerCache(DeepseekV32IndexerCache):
         return Ernie5_5IndexerBackend
 
 
+@triton.jit
+def _store_indexer_fp4(
+    values_ptr,
+    scales_ptr,
+    cache_ptr,
+    slots_ptr,
+    values_stride,
+    scales_stride,
+    cache_stride,
+    PAGE_SIZE: tl.constexpr,
+    VALUE_BYTES: tl.constexpr,
+    SCALE_BYTES: tl.constexpr,
+):
+    row = tl.program_id(0)
+    slot = tl.load(slots_ptr + row).to(tl.int64)
+    if slot < 0:
+        return
+    page_base = slot // PAGE_SIZE * cache_stride
+    offset = slot % PAGE_SIZE
+    values = tl.arange(0, VALUE_BYTES)
+    scales = tl.arange(0, SCALE_BYTES)
+    # DeepGEMM pages hold all packed values first, then all UE8M0 scales.
+    tl.store(
+        cache_ptr + page_base + offset * VALUE_BYTES + values,
+        tl.load(values_ptr + row * values_stride + values),
+    )
+    tl.store(
+        cache_ptr + page_base + PAGE_SIZE * VALUE_BYTES + offset * SCALE_BYTES + scales,
+        tl.load(scales_ptr + row * scales_stride + scales),
+    )
+
+
 class Ernie5_5Indexer(nn.Module):
     """Lightning indexer scoring the tokens older than the sliding window."""
 
@@ -511,6 +549,23 @@ class Ernie5_5Indexer(nn.Module):
         self.n_head = config.index_n_heads
         self.head_dim = config.index_head_dim
         self.rope_dim = config.mla_qk_rope_head_dim
+        self.use_fp4_kv = dsa_indexer_uses_fp4(vllm_config)
+        if self.use_fp4_kv:
+            parallel_config = vllm_config.parallel_config
+            pcp_size = parallel_config.prefill_context_parallel_size
+            dcp_size = parallel_config.decode_context_parallel_size
+            # The external FP4 cache writer does not handle CP-sharded inputs.
+            if pcp_size != 1 or dcp_size != 1:
+                raise NotImplementedError(
+                    "ERNIE 5.5 MXFP4 indexer currently requires PCP=DCP=1 "
+                    "(prefill_context_parallel_size=1 and "
+                    "decode_context_parallel_size=1). "
+                    f"Got PCP={pcp_size}, DCP={dcp_size}."
+                )
+        logger.info_once(
+            "Using %s indexer cache for Lightning Indexer.",
+            "MXFP4" if self.use_fp4_kv else "FP8",
+        )
         self.wq_b = ReplicatedLinear(
             config.mla_q_lora_rank,
             self.n_head * self.head_dim,
@@ -539,8 +594,15 @@ class Ernie5_5Indexer(nn.Module):
         # Read by the sparse MLA impl through its indexer, so this holds the
         # merged rows; the op writes its top-k to a buffer of row stride topk.
         self.topk_indices_buffer = swa_topk_buffer
+        if self.use_fp4_kv:
+            # MXFP4 stores two values per byte plus one UE8M0 byte per 32 values.
+            # head_dim bytes = 64 packed values + 4 UE8M0 scales = 68.
+            k_cache_head_dim = self.head_dim // 2 + self.head_dim // MXFP4_BLOCK_SIZE
+        else:
+            # head_dim bytes = 128 fp8 + 4 fp32 scale = 132.
+            k_cache_head_dim = self.head_dim + self.head_dim // INDEXER_QUANT_BLOCK * 4
         self.k_cache = Ernie5_5IndexerCache(
-            head_dim=self.head_dim + self.head_dim // INDEXER_QUANT_BLOCK * 4,
+            head_dim=k_cache_head_dim,
             dtype=torch.uint8,
             prefix=f"{prefix}.k_cache",
             cache_config=cache_config,
@@ -554,6 +616,8 @@ class Ernie5_5Indexer(nn.Module):
             vllm_config.model_config.max_model_len,
             get_max_prefill_buffer_size(vllm_config),
             topk_indices_buffer,
+            skip_k_cache_insert=self.use_fp4_kv,
+            use_fp4_cache=self.use_fp4_kv,
         )
 
     def forward(
@@ -574,12 +638,62 @@ class Ernie5_5Indexer(nn.Module):
         q = hadamard_rows(q.view(-1, self.head_dim))
         k = hadamard_rows(k)
 
-        q_fp8, q_scale = per_token_group_quant_fp8(
-            q, INDEXER_QUANT_BLOCK, column_major_scales=False, use_ue8m0=True
+        if self.use_fp4_kv:
+            q, q_scale = self._quantize_fp4(q, k)
+            # Group-32 Q scales travel with Q and cannot be folded into weights.
+            weights = weights * self.weights_scale
+            q_with_scale = (q, q_scale)
+        else:
+            q, q_scale = per_token_group_quant_fp8(
+                q, INDEXER_QUANT_BLOCK, column_major_scales=False, use_ue8m0=True
+            )
+            q = q.view(-1, self.n_head, self.head_dim)
+            weights = weights * q_scale.view(-1, self.n_head) * self.weights_scale
+            q_with_scale = (q, None)
+        return self.indexer_op(
+            hidden_states, q_with_scale, None if self.use_fp4_kv else k, weights
         )
-        q_fp8 = q_fp8.view(-1, self.n_head, self.head_dim)
-        weights = weights * q_scale.view(-1, self.n_head) * self.weights_scale
-        return self.indexer_op(hidden_states, q_fp8, k, weights)
+
+    def _quantize_fp4(
+        self, q: torch.Tensor, k: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        # Small row tiles keep decode Q from underfilling the GPU.
+        q_values, q_scales, _ = downcast_to_mxfp(
+            q,
+            axis=-1,
+            BLOCK_OUT_DIM=4 if q.shape[0] <= 1024 else 16,
+            BLOCK_QUANT_DIM=self.head_dim,
+        )
+        metadata = get_forward_context().attn_metadata
+        # Profiling has neither an allocated cache nor a real slot mapping.
+        if isinstance(metadata, dict):
+            cache = self.k_cache.kv_cache
+            slots = metadata[self.k_cache.prefix].slot_mapping
+            num_tokens = min(k.shape[0], slots.numel())
+            if num_tokens:
+                k_values, k_scales, _ = downcast_to_mxfp(
+                    k[:num_tokens],
+                    axis=-1,
+                    BLOCK_OUT_DIM=min(triton.next_power_of_2(num_tokens), 32),
+                    BLOCK_QUANT_DIM=self.head_dim,
+                )
+                _store_indexer_fp4[(num_tokens,)](
+                    k_values,
+                    k_scales,
+                    cache,
+                    slots,
+                    k_values.stride(0),
+                    k_scales.stride(0),
+                    cache.stride(0),
+                    PAGE_SIZE=cache.shape[1],
+                    VALUE_BYTES=self.head_dim // 2,
+                    SCALE_BYTES=self.head_dim // MXFP4_BLOCK_SIZE,
+                    num_warps=1,
+                )
+        return (
+            q_values.view(-1, self.n_head, self.head_dim // 2),
+            q_scales.view(torch.int32).view(-1, self.n_head),
+        )
 
 
 class Ernie5_5MLAAttention(MLAAttention):
