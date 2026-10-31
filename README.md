@@ -57,6 +57,21 @@ vllm serve baidu/ERNIE-5.5-Flash-Base-BF16 \
     --max-num-batched-tokens 8192 --max-cudagraph-capture-size 512
 ```
 
+### MXFP4 indexer
+
+On SM100-family datacenter GPUs, select MXFP4 for the indexer's runtime Q and
+K cache with the existing attention option:
+
+```bash
+vllm serve baidu/ERNIE-5.5-Flash-Base-BF16 \
+    --data-parallel-size 4 --enable-expert-parallel \
+    --attention-config '{"indexer_kv_dtype":"mxfp4"}'
+```
+
+The MXFP4 indexer currently requires `--prefill-context-parallel-size 1` and
+`--decode-context-parallel-size 1` (the defaults). Other PCP/DCP sizes are rejected
+during indexer initialization.
+
 ### DSpark instead of MTP
 
 > **Note:** the DSpark draft checkpoint is coming soon.
