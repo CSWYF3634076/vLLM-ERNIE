@@ -19,12 +19,14 @@ repo names are the same on both hubs.
 
 ## Model Introduction
 
-ERNIE-5.5-Flash is a sparse Mixture-of-Experts language model in Baidu's ERNIE
-5.5 family, with 280B total and 14B activated parameters per token (excluding
-the 0.36B ECHO layer), pre-trained from scratch on 33.5T tokens with a context
-of up to 128K. Inference supports up to 1,048,576 tokens.
+ERNIE-5.5-Flash is a sparse Mixture-of-Experts language model from Baidu, with
+280B total and 14B activated parameters per token (excluding the 0.36B ECHO
+layer), pre-trained from scratch on 33.5T tokens with a context of up to 128K.
+Inference supports up to 1,048,576 tokens.
 
-- **Hybrid HCA + MLA-DSA attention.** 37 of the 43 layers use Heavily
+
+
+- **Hybrid HCA + MLA-DSA Attention.** 37 of the 43 layers use Heavily
   Compressed Attention (one cached entry per 128 tokens plus a 128-token
   sliding window); 6 layers keep full-context access through MLA with DSA
   sparse attention (top-2048 tokens).
@@ -35,7 +37,7 @@ of up to 128K. Inference supports up to 1,048,576 tokens.
   activations.
 - **mHC.** Manifold-constrained hyper-connections (expansion rate 4) replace
   the residual stream.
-- **MultiMax output head** with a learnable piece-wise temperature.
+- **MultiMax Output Head.** with a learnable piece-wise temperature.
 - **ECHO.** The final layer, trained to predict future tokens, doubles as a
   built-in draft; vLLM runs it through its MTP path.
 
