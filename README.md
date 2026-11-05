@@ -30,7 +30,7 @@ Inference supports up to 1,048,576 tokens.
   Compressed Attention (one cached entry per 128 tokens plus a 128-token
   sliding window); 6 layers keep full-context access through MLA with DSA
   sparse attention (top-2048 tokens).
-- **Gated attention and Virtual Head Attention (VHA).** Every attention layer
+- **Gated Attention and Virtual Head Attention (VHA).** Every attention layer
   adds a low-rank output gate, a low-rank post-mix across heads and QK-norm.
 - **Multi-Router Latent MoE.** 42 MoE layers, each with 512 routed experts
   (top-10) and 1 shared expert in a 2048-d latent space, with SiTU-GLU
