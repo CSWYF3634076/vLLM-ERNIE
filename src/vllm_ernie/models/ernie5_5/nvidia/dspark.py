@@ -96,12 +96,7 @@ class Ernie5_5DSparkModel(nn.Module):
             config.hidden_size,
             bias=False,
             return_bias=False,
-            # FP8 in MXFP4-expert checkpoints, BF16 in the others.
-            quant_config=(
-                vllm_config.quant_config
-                if use_ernie5_5_mxfp4_experts(vllm_config)
-                else None
-            ),
+            quant_config=vllm_config.quant_config,
             prefix=maybe_prefix(prefix, "main_proj"),
         )
         self.main_norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
