@@ -186,8 +186,8 @@ def _register_renderer() -> None:
         "Ernie5_5Renderer",
     )
 
-    # Use the ERNIE renderer by default; it falls back to HfRenderer when the
-    # checkpoint ships a jinja template.
+    # Use the ERNIE renderer by default; it falls back to HfRenderer for an
+    # explicit --chat-template or a tokenizer without the Python protocol.
     orig = RendererRegistry.load_renderer
     if getattr(orig, "_ernie5_default_renderer", False):
         return

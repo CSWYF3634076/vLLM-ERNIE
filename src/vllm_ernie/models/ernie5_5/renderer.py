@@ -8,13 +8,18 @@ Rendering to text and re-tokenizing would turn marker strings quoted in user or
 tool text into control tokens, so such prompts are encoded segment by segment:
 only renderer-emitted markers become added-token ids.
 
-Tokenizers with a Jinja template, or requests with an explicit chat template,
-keep the ``HfRenderer`` path.
+The Python protocol is used even when the checkpoint also ships
+``chat_template.jinja``. An explicit ``--chat-template`` (or a trusted request
+``chat_template``) renders that Jinja through ``HfRenderer`` and HF's own
+``apply_chat_template``, since ``ErnieChatTokenizer`` rejects template overrides.
 """
 
 import functools
 import inspect
+from types import MethodType
 from typing import Any
+
+from transformers.tokenization_utils_base import PreTrainedTokenizerBase
 
 from vllm.logger import init_logger
 from vllm.renderers.chat_utils import (
@@ -36,10 +41,13 @@ _SERVING_KWARGS = frozenset({"chat_template", "return_dict", "tokenize", "docume
 
 
 def uses_python_chat(tokenizer: Any, chat_template: str | None) -> bool:
-    """Whether to render with the tokenizer's Python chat protocol."""
+    """Whether to render with the tokenizer's Python chat protocol.
+
+    A template shipped with the tokenizer does not count; only an explicit
+    ``chat_template`` selects Jinja.
+    """
     return (
         chat_template is None
-        and getattr(tokenizer, "chat_template", None) is None
         and callable(getattr(tokenizer, "render_chat", None))
         and callable(getattr(tokenizer, "encode_segments", None))
     )
@@ -101,6 +109,11 @@ class Ernie5_5Renderer(HfRenderer):
     def __init__(self, config, tokenizer) -> None:
         super().__init__(config, tokenizer)
         self._render_ids_async = make_async(self._render_ids, executor=self._executor)
+        if uses_python_chat(self.tokenizer, None):
+            # The HfRenderer path is only reached with an explicit template.
+            self.tokenizer.apply_chat_template = MethodType(
+                PreTrainedTokenizerBase.apply_chat_template, self.tokenizer
+            )
 
     def _render_ids(
         self,
