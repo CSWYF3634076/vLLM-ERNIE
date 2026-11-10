@@ -94,7 +94,8 @@ class Ernie5_5DSparkModel(nn.Module):
             config.hidden_size,
             bias=False,
             return_bias=False,
-            quant_config=vllm_config.quant_config,
+            # BF16 even in FP8 checkpoints.
+            quant_config=None,
             prefix=maybe_prefix(prefix, "main_proj"),
         )
         self.main_norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
@@ -297,11 +298,14 @@ class Ernie5_5DSparkForCausalLM(nn.Module):
                 yield name, loaded_weight.t()
                 continue
             if ".self_attn.linear_kv_proj." in name:
-                # Each stage's context KV comes from the shared projection.
-                layer_idx = name.removeprefix("model.layers.").split(".", 1)[0]
+                # Each stage's context KV comes from the shared projection;
+                # keep the leaf so FP8 `weight_scale_inv` loads alongside.
+                layer_idx, _, leaf = name.removeprefix("model.layers.").partition(
+                    ".self_attn.linear_kv_proj."
+                )
                 context_weight = loaded_weight.detach()
                 context_weight.shard_id = int(layer_idx)
-                yield "model.context_wkv_proj.weight", context_weight
+                yield f"model.context_wkv_proj.{leaf}", context_weight
             mapped = ernie5_5_mapper._map_name_with_shard(name)
             if mapped is None:
                 continue
