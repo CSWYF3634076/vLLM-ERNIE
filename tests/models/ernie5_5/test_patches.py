@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Tests for the hooks that patch shared vLLM code for ERNIE 5.5."""
 
+import asyncio
 import pickle
 from types import SimpleNamespace
 from typing import get_args
@@ -90,6 +91,54 @@ def test_dspark_draft_keeps_own_config():
     assert verified
 
 
+def test_bundled_dspark_draft_reshapes_target_config():
+    config = Ernie5_5Config(
+        num_hidden_layers=4,
+        num_nextn_predict_layers=0,
+        compress_ratios=[128, -2, 128, 4],
+        dspark_target_layer_ids=[1, 2, 3],
+        dspark_noise_token_id=1024,
+        dspark_markov_rank=256,
+    )
+    config.architectures = ["DSparkDraftModel"]
+    draft = SimpleNamespace(
+        architectures=["DSparkDraftModel"],
+        hf_config=config,
+        quantization="fp8",
+        _verify_quantization=lambda: None,
+    )
+    spec = SimpleNamespace(method="dspark", draft_model_config=draft, quantization=None)
+    _undo_dspark_rewrite(spec)
+    assert config.architectures == ["Ernie5_5_MoeDSparkDraftModel"]
+    assert config.model_type == "ernie5_5_moe"
+    assert config.num_hidden_layers == 3
+    assert config.compress_ratios == [128] * 3
+    assert config.first_k_dense_replace == 0
+    assert config.mask_token_id == 1024
+    assert config.enable_confidence_head
+    assert config.dspark_bundled_in_target
+    assert not config.bundles_dspark_draft
+
+
+def test_unbundle_dspark_weights():
+    from vllm_ernie.models.ernie5_5.nvidia.dspark import _unbundle_dspark_weights
+
+    names = [
+        "model.layers.0.input_layernorm.weight",
+        "model.norm.weight",
+        "lm_head.weight",
+        "model.mtp.2.input_layernorm.weight",
+        "model.mtp.markov_head.markov_w1.weight",
+        "model.mtp.mhc_contract.hc_head_fn",
+    ]
+    out = [name for name, _ in _unbundle_dspark_weights((n, None) for n in names)]
+    assert out == [
+        "model.layers.2.input_layernorm.weight",
+        "model.markov_head.markov_w1.weight",
+        "model.mhc_contract.hc_head_fn",
+    ]
+
+
 class _FakeRequest:
     def __init__(self, status, params):
         self.request_id = "r"
@@ -144,3 +193,67 @@ def test_mooncake_sends_stopped_prefill(model_type, status_name, sends):
     assert ("r" in scheduler._reqs_need_send) is sends
     assert ("t" in scheduler._reqs_not_processed) is not sends
     assert request.status is status
+
+
+class _StopRender(Exception):
+    pass
+
+
+class _FakeOnlineRenderer:
+    def __init__(self, model_type: str):
+        self.model_config = SimpleNamespace(
+            hf_config=SimpleNamespace(model_type=model_type)
+        )
+
+    @property
+    def renderer(self):
+        # Stop right after the ERNIE hook, before any real rendering.
+        raise _StopRender
+
+
+_TOOLS = [{"type": "function", "function": {"name": "f", "parameters": {}}}]
+
+
+@pytest.mark.parametrize(
+    ("model_type", "parallel", "tools", "user_options", "expected"),
+    [
+        ("ernie5_5_moe", False, _TOOLS, None, {"parallel_tool_calls": False}),
+        ("ernie5_5_moe", True, _TOOLS, None, None),
+        ("ernie5_5_moe", False, None, None, None),
+        # An explicit option from the user wins.
+        (
+            "ernie5_5_moe",
+            False,
+            _TOOLS,
+            {"parallel_tool_calls": True, "thinking_mode": "close"},
+            {"parallel_tool_calls": True, "thinking_mode": "close"},
+        ),
+        ("deepseek_v4", False, _TOOLS, None, None),
+    ],
+)
+def test_parallel_tool_calls_false_reaches_template(
+    model_type, parallel, tools, user_options, expected
+):
+    from vllm.entrypoints.openai.chat_completion.protocol import (
+        ChatCompletionRequest,
+    )
+    from vllm.renderers.online_renderer import OnlineRenderer
+
+    request = ChatCompletionRequest(
+        messages=[{"role": "user", "content": "hi"}],
+        model="m",
+        tools=tools,
+        parallel_tool_calls=parallel,
+        chat_template_kwargs=(
+            {"options": user_options} if user_options is not None else None
+        ),
+    )
+    with pytest.raises(_StopRender):
+        asyncio.run(
+            OnlineRenderer.preprocess_chat(
+                _FakeOnlineRenderer(model_type), request, [], None, "auto", None
+            )
+        )
+
+    kwargs = request.build_chat_params(None, "auto").chat_template_kwargs
+    assert kwargs.get("options") == expected

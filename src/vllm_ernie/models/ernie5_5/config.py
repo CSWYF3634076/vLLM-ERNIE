@@ -128,6 +128,29 @@ class Ernie5_5Config(PretrainedConfig):
         kwargs.setdefault("head_dtype", "float32")
         super().__init__(tie_word_embeddings=tie_word_embeddings, **kwargs)
 
+    @property
+    def bundles_dspark_draft(self) -> bool:
+        """Whether this is a target config whose checkpoint bundles a DSpark
+        draft under `model.mtp.*`, described by the top-level `dspark_*` keys.
+        """
+        layer_ids = getattr(self, "dspark_target_layer_ids", None)
+        return bool(layer_ids) and self.num_hidden_layers > len(layer_ids)
+
+    def to_bundled_dspark_draft(self) -> None:
+        """Reshape a target config that bundles a DSpark draft into the
+        draft's, matching a standalone draft export."""
+        num_layers = len(self.dspark_target_layer_ids)
+        self.num_hidden_layers = num_layers
+        # The draft layers are HCA layers.
+        self.compress_ratios = [max(self.compress_ratios)] * num_layers
+        self.first_k_dense_replace = 0
+        if getattr(self, "mask_token_id", None) is None:
+            self.mask_token_id = self.dspark_noise_token_id
+        # Like SGLang, assume the head is present; loading drops it otherwise.
+        if getattr(self, "enable_confidence_head", None) is None:
+            self.enable_confidence_head = True
+        self.dspark_bundled_in_target = True
+
     def is_dsa_layer(self, layer_id: int) -> bool:
         # Layers past `compress_ratios` (DSpark draft layers) are SWA-only.
         return (

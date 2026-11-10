@@ -51,6 +51,22 @@ _DSPARK_RENAMES = {
 }
 # Shared from the target after loading.
 _TARGET_OWNED = ("lm_head.", "model.embed_tokens.", "model.lm_head.")
+_BUNDLED_PREFIX = "model.mtp."
+
+
+def _unbundle_dspark_weights(
+    weights: Iterable[tuple[str, torch.Tensor]],
+) -> Iterable[tuple[str, torch.Tensor]]:
+    """Rename a draft bundled under `model.mtp.*` to the standalone export
+    layout and drop the target's weights, whose names would clash."""
+    for name, loaded_weight in weights:
+        rest = name.removeprefix(_BUNDLED_PREFIX)
+        if rest == name:
+            continue
+        if rest.partition(".")[0].isdigit():
+            yield f"model.layers.{rest}", loaded_weight
+        else:
+            yield f"model.{rest}", loaded_weight
 
 
 class Ernie5_5DSparkModel(nn.Module):
@@ -105,13 +121,13 @@ class Ernie5_5DSparkModel(nn.Module):
         )
         for layer in self.layers:
             attn = layer.attn
-            # Trained with the compressed-layer YaRN (compress_rope_theta).
+            # Trained with plain RoPE at rope_theta (no YaRN), like SWA layers.
             attn.rotary_emb = attn.indexer_rotary_emb = build_deepseek_v4_rope(
                 config,
                 head_dim=attn.head_dim,
                 rope_head_dim=attn.rope_head_dim,
                 max_position_embeddings=target_config.max_position_embeddings,
-                compress_ratio=max(config.compress_ratios),
+                compress_ratio=1,
             )
         self.context_wkv_proj = MergedColumnParallelLinear(
             config.hidden_size,
@@ -206,7 +222,7 @@ class Ernie5_5DSparkForCausalLM(nn.Module):
         self.model = Ernie5_5DSparkModel(
             vllm_config=vllm_config, prefix=maybe_prefix(prefix, "model")
         )
-        # Replaced by the target's lm_head (with its multimax) after loading.
+        # Replaced by the target's lm_head after loading.
         self.lm_head = Ernie5_5ParallelLMHead(
             self.config.vocab_size,
             self.config.hidden_size,
@@ -242,8 +258,9 @@ class Ernie5_5DSparkForCausalLM(nn.Module):
         return self.model(input_ids, positions, inputs_embeds)
 
     def compute_logits(self, hidden_states: torch.Tensor) -> torch.Tensor:
-        logits = self.logits_processor(self.lm_head, self.model.norm(hidden_states))
-        return self.lm_head.multimax(logits)
+        # No multimax, like SGLang: the target's is non-monotonic past a
+        # ckpt-dependent logit and demotes confident draft tokens.
+        return self.logits_processor(self.lm_head, self.model.norm(hidden_states))
 
     def compute_draft_logits(self, hidden_states: torch.Tensor) -> torch.Tensor:
         return self.compute_logits(hidden_states)
@@ -293,7 +310,14 @@ class Ernie5_5DSparkForCausalLM(nn.Module):
                 loaded_weight.shard_id = shard_id
             yield name, loaded_weight
 
+    def is_unused_checkpoint_weight(self, name: str) -> bool:
+        # Lets the loader skip the bundling target's shards without draft weights.
+        bundled = getattr(self.config, "dspark_bundled_in_target", False)
+        return bundled and not name.startswith(_BUNDLED_PREFIX)
+
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
+        if getattr(self.config, "dspark_bundled_in_target", False):
+            weights = _unbundle_dspark_weights(weights)
         loaded_params = load_ernie5_5_weights(
             self,
             self._map_weights(weights),
