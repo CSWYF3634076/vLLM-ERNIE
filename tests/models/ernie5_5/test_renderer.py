@@ -104,12 +104,13 @@ def test_ernie_renderer_is_default(monkeypatch, model_type, mode, expected):
     assert RENDERER_REGISTRY.load_renderer(mode, config, None) == expected
 
 
-def test_uses_python_chat_only_without_jinja():
+def test_uses_python_chat_unless_template_is_explicit():
+    """A shipped chat_template.jinja must not disable the Python protocol."""
     tokenizer = _ChatTokenizer()
     assert uses_python_chat(tokenizer, None)
     assert not uses_python_chat(tokenizer, "{{ messages }}")
     tokenizer.chat_template = "{{ messages }}"
-    assert not uses_python_chat(tokenizer, None)
+    assert uses_python_chat(tokenizer, None)
     assert not uses_python_chat(MagicMock(spec=["chat_template"]), None)
 
 
