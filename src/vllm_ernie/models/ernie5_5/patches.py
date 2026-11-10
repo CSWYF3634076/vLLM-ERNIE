@@ -14,6 +14,7 @@ ERNIE5_MODEL_TYPE = "ernie5_5_moe"
 ERNIE5_MTP_MODEL_TYPE = "ernie5_5_moe_mtp"
 ERNIE5_MTP_ARCH = "Ernie5_5MoeMTPModel"
 ERNIE5_DSPARK_ARCH = "Ernie5_5_MoeDSparkDraftModel"
+ERNIE5_TOKENIZER_MODE = "ernie5_5"
 ERNIE5_BREAKABLE_CUDAGRAPH_ARCHITECTURES = (
     "Ernie5_5MoeMTPModel",
     "Ernie5_5_MoeForCausalLM",
@@ -82,18 +83,27 @@ def _ernie5_hf_config_override(hf_config):
 
 def _undo_dspark_rewrite(spec_config) -> None:
     # Restore the ERNIE DSpark draft config rewritten by __post_init__.
+    from vllm_ernie.models.ernie5_5.config import Ernie5_5Config
+
     draft = spec_config.draft_model_config
-    if (
-        spec_config.method == "dspark"
-        and ERNIE5_DSPARK_ARCH in draft.architectures
-        and draft.hf_config.architectures == ["DSparkDraftModel"]
-    ):
-        draft.hf_config.model_type = ERNIE5_MODEL_TYPE
-        draft.hf_config.architectures = [ERNIE5_DSPARK_ARCH]
-        # The rewrite also copied the target quantization; re-derive the
-        # draft's own from its checkpoint.
-        draft.quantization = spec_config.quantization
-        draft._verify_quantization()
+    hf_config = draft.hf_config
+    if spec_config.method != "dspark" or hf_config.architectures != [
+        "DSparkDraftModel"
+    ]:
+        return
+    if ERNIE5_DSPARK_ARCH not in draft.architectures:
+        # Without a draft path the draft config is the target's.
+        if not (
+            isinstance(hf_config, Ernie5_5Config) and hf_config.bundles_dspark_draft
+        ):
+            return
+        hf_config.to_bundled_dspark_draft()
+    hf_config.model_type = ERNIE5_MODEL_TYPE
+    hf_config.architectures = [ERNIE5_DSPARK_ARCH]
+    # The rewrite also copied the target quantization; re-derive the
+    # draft's own from its checkpoint.
+    draft.quantization = spec_config.quantization
+    draft._verify_quantization()
 
 
 def _patch_speculative_config() -> None:
@@ -138,6 +148,72 @@ def _register_parsers() -> None:
     ToolParserManager.register_lazy_module(
         "ernie5", "vllm_ernie.models.ernie5_5.tool_parser", "Ernie5ToolParser"
     )
+
+
+def _register_renderer() -> None:
+    from vllm.renderers.registry import RENDERER_REGISTRY, RendererRegistry
+    from vllm.tokenizers.registry import TokenizerRegistry
+
+    TokenizerRegistry.register(
+        ERNIE5_TOKENIZER_MODE, "vllm.tokenizers.hf", "CachedHfTokenizer"
+    )
+    RENDERER_REGISTRY.register(
+        ERNIE5_TOKENIZER_MODE,
+        "vllm_ernie.models.ernie5_5.renderer",
+        "Ernie5_5Renderer",
+    )
+
+    # Use the ERNIE renderer by default; it falls back to HfRenderer when the
+    # checkpoint ships a jinja template.
+    orig = RendererRegistry.load_renderer
+    if getattr(orig, "_ernie5_default_renderer", False):
+        return
+
+    @functools.wraps(orig)
+    def load_renderer(self, renderer_mode, config, tokenizer):
+        if (
+            renderer_mode == "hf"
+            and config.model_config.hf_config.model_type == ERNIE5_MODEL_TYPE
+        ):
+            renderer_mode = ERNIE5_TOKENIZER_MODE
+        return orig(self, renderer_mode, config, tokenizer)
+
+    load_renderer._ernie5_default_renderer = True  # type: ignore[attr-defined]
+    RendererRegistry.load_renderer = load_renderer
+
+
+def _with_parallel_tool_calls_option(request) -> None:
+    """Pass ``parallel_tool_calls=false`` to the chat template as an option.
+
+    The ERNIE template reads ``options.parallel_tool_calls`` and announces
+    parallel calls unless it is false; ``ChatParams`` has no such field.
+    """
+    if not getattr(request, "tools", None):
+        return
+    if getattr(request, "parallel_tool_calls", True) is not False:
+        return
+    kwargs = dict(request.chat_template_kwargs or {})
+    options = dict(kwargs.get("options") or {})
+    options.setdefault("parallel_tool_calls", False)
+    kwargs["options"] = options
+    request.chat_template_kwargs = kwargs
+
+
+def _patch_parallel_tool_calls() -> None:
+    from vllm.renderers.online_renderer import OnlineRenderer
+
+    orig = OnlineRenderer.preprocess_chat
+    if getattr(orig, "_ernie5_parallel_tool_calls", False):
+        return
+
+    @functools.wraps(orig)
+    async def preprocess_chat(self, request, *args, **kwargs):
+        if self.model_config.hf_config.model_type == ERNIE5_MODEL_TYPE:
+            _with_parallel_tool_calls_option(request)
+        return await orig(self, request, *args, **kwargs)
+
+    preprocess_chat._ernie5_parallel_tool_calls = True  # type: ignore[attr-defined]
+    OnlineRenderer.preprocess_chat = preprocess_chat
 
 
 _MOONCAKE = "MooncakeConnector"
@@ -218,4 +294,6 @@ def apply_patches() -> None:
     _patch_arch_config_convertors()
     _patch_speculative_config()
     _register_parsers()
+    _register_renderer()
+    _patch_parallel_tool_calls()
     _patch_mooncake_connector()

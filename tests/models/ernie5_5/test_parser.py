@@ -8,9 +8,10 @@ the chat-template thinking switches, the ``<|ernie:im_*|>`` turn scoping of
 """
 
 import json
-from unittest.mock import MagicMock
+import re
 
 import pytest
+import xgrammar as xgr
 from parser_helpers import (
     collect_function_name,
     collect_tool_arguments,
@@ -18,8 +19,7 @@ from parser_helpers import (
     simulate_reasoning_streaming,
     simulate_tool_streaming,
 )
-from xgrammar import Grammar, StructuralTag
-from xgrammar.testing import _is_grammar_accept_string
+from xgrammar import StructuralTag
 
 from vllm.entrypoints.openai.chat_completion.protocol import (
     ChatCompletionRequest,
@@ -306,7 +306,28 @@ def _call(*cities: str) -> str:
     return f"{TOOL_CALL_START}\n{invokes}{TOOL_CALL_END}"
 
 
-def _grammar(tools, tool_choice="required", parallel=True) -> Grammar:
+# One token per ASCII char, with the markers as single control tokens.
+_STOP_ID = 0
+_VOCAB = [chr(i) for i in range(128)]
+_VOCAB[_TOOL_CALL_START_ID] = TOOL_CALL_START
+_VOCAB[_TOOL_CALL_END_ID] = TOOL_CALL_END
+_MARKER_IDS = {TOOL_CALL_START: _TOOL_CALL_START_ID, TOOL_CALL_END: _TOOL_CALL_END_ID}
+_MARKER_RE = re.compile(f"({re.escape(TOOL_CALL_START)}|{re.escape(TOOL_CALL_END)})")
+
+
+def _encode(text: str, spell_markers: bool = False) -> list[int]:
+    ids: list[int] = []
+    for part in _MARKER_RE.split(text):
+        if part in _MARKER_IDS and not spell_markers:
+            ids.append(_MARKER_IDS[part])
+        else:
+            ids.extend(ord(c) for c in part)
+    return ids
+
+
+def _grammar(
+    tokenizer, tools, tool_choice="required", parallel=True
+) -> xgr.CompiledGrammar:
     request = ChatCompletionRequest(
         messages=[],
         model="m",
@@ -314,9 +335,18 @@ def _grammar(tools, tool_choice="required", parallel=True) -> Grammar:
         tool_choice=tool_choice,
         parallel_tool_calls=parallel,
     )
-    tag = Ernie5ToolParser(MagicMock(), tools).get_structural_tag(request)
+    tag = Ernie5ToolParser(tokenizer, tools).get_structural_tag(request)
     assert isinstance(tag, StructuralTag)
-    return Grammar.from_structural_tag(tag)
+    # vLLM validates the tag without a tokenizer.
+    xgr.Grammar.from_structural_tag(tag)
+    info = xgr.TokenizerInfo(_VOCAB, stop_token_ids=[_STOP_ID])
+    return xgr.GrammarCompiler(info).compile_structural_tag(tag)
+
+
+def _accepts(grammar, text: str, spell_markers: bool = False) -> bool:
+    matcher = xgr.GrammarMatcher(grammar)
+    ids = _encode(text, spell_markers) + [_STOP_ID]
+    return all(matcher.accept_token(i) for i in ids) and matcher.is_terminated()
 
 
 class TestStructuralTag:
@@ -332,34 +362,42 @@ class TestStructuralTag:
         "tool_choice",
         ["required", {"type": "function", "function": {"name": "get_weather"}}],
     )
-    def test_required_and_named_use_native_format(self, tools, tool_choice):
+    def test_required_and_named_use_native_format(
+        self, mock_tokenizer, tools, tool_choice
+    ):
         # The parser only reads <ernie:tool_call>, so required/named must not
         # fall back to the JSON-array constraint.
-        grammar = _grammar(tools, tool_choice)
-        assert _is_grammar_accept_string(grammar, _call("Paris"))
-        assert _is_grammar_accept_string(grammar, _call("Paris", "Rome"))
-        assert not _is_grammar_accept_string(
+        grammar = _grammar(mock_tokenizer, tools, tool_choice)
+        assert _accepts(grammar, _call("Paris"))
+        assert _accepts(grammar, _call("Paris", "Rome"))
+        assert not _accepts(
             grammar, '[{"name": "get_weather", "parameters": {"city": "Paris"}}]'
         )
         # The argument schema is pinned even without ``strict``.
-        assert not _is_grammar_accept_string(
+        assert not _accepts(
             grammar,
             f'{TOOL_CALL_START}\n<invoke name="get_weather">'
             f'<parameter name="zip">1</parameter></invoke>\n{TOOL_CALL_END}',
         )
 
-    def test_parallel_tool_calls_false_allows_one_invoke(self, tools):
-        grammar = _grammar(tools, parallel=False)
-        assert _is_grammar_accept_string(grammar, _call("Paris"))
-        assert not _is_grammar_accept_string(grammar, _call("Paris", "Rome"))
+    def test_required_markers_are_control_tokens(self, mock_tokenizer, tools):
+        # The streaming parser only reads the marker ids; spelled-out markers
+        # would leak into content.
+        grammar = _grammar(mock_tokenizer, tools)
+        assert not _accepts(grammar, _call("Paris"), spell_markers=True)
 
-    def test_auto_strict_allows_free_text(self, tools):
+    def test_parallel_tool_calls_false_allows_one_invoke(self, mock_tokenizer, tools):
+        grammar = _grammar(mock_tokenizer, tools, parallel=False)
+        assert _accepts(grammar, _call("Paris"))
+        assert not _accepts(grammar, _call("Paris", "Rome"))
+
+    def test_auto_strict_allows_free_text(self, mock_tokenizer, tools):
         strict = [
             t.model_copy(
                 update={"function": t.function.model_copy(update={"strict": True})}
             )
             for t in tools
         ]
-        grammar = _grammar(strict, "auto")
-        assert _is_grammar_accept_string(grammar, "Just answering.")
-        assert _is_grammar_accept_string(grammar, "Checking.\n" + _call("Paris"))
+        grammar = _grammar(mock_tokenizer, strict, "auto")
+        assert _accepts(grammar, "Just answering.")
+        assert _accepts(grammar, "Checking.\n" + _call("Paris"))

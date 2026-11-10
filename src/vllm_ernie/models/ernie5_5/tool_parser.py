@@ -12,6 +12,7 @@ from xgrammar.structural_tag import (
     SequenceFormat,
     TagFormat,
     TagsWithSeparatorFormat,
+    TokenFormat,
     TriggeredTagsFormat,
 )
 
@@ -108,14 +109,37 @@ class Ernie5ToolParser(Ernie5ParserToolAdapter):  # type: ignore[valid-type, mis
         tag = super().get_structural_tag(
             request, reasoning=reasoning, strict_level=strict_level
         )
-        if tag is None or getattr(request, "parallel_tool_calls", True) is not False:
+        if tag is None:
             return tag
-        # parallel_tool_calls=false allows a single invoke.
-        fmt = tag.format
-        invokes = (
-            fmt.tags[0].content
-            if isinstance(fmt, TriggeredTagsFormat)
-            else fmt.elements[1]  # type: ignore[union-attr]
-        )
-        invokes.stop_after_first = True
+        if getattr(request, "parallel_tool_calls", True) is False:
+            # parallel_tool_calls=false allows a single invoke.
+            fmt = tag.format
+            invokes = (
+                fmt.tags[0].content
+                if isinstance(fmt, TriggeredTagsFormat)
+                else fmt.elements[1]  # type: ignore[union-attr]
+            )
+            invokes.stop_after_first = True
+        self._force_marker_tokens(tag)
         return tag
+
+    def _force_marker_tokens(self, tag: StructuralTag) -> None:
+        """Match the forced ``<ernie:tool_call>`` markers by token id.
+
+        As text, xgrammar also accepts the markers spelled with ordinary
+        tokens, which the model then emits under required/named; the
+        streaming parser reads only the control ids and leaks that text as
+        content. Ids are resolved here because vLLM validates the tag
+        without a tokenizer.
+        """
+        fmt = tag.format
+        start_id = self.vocab.get(TOOL_CALL_START)
+        end_id = self.vocab.get(TOOL_CALL_END)
+        if not isinstance(fmt, SequenceFormat) or start_id is None or end_id is None:
+            return
+        fmt.elements = [
+            TokenFormat(token=start_id),
+            ConstStringFormat(value="\n"),
+            fmt.elements[1],
+            TokenFormat(token=end_id),
+        ]

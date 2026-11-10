@@ -425,12 +425,17 @@ class Ernie5_5Model(nn.Module, EagleModelMixin):
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
         num_layers = self.config.num_hidden_layers
-        # The trailing layers belong to the MTP draft model.
-        weights = (
-            (name, w)
-            for name, w in weights
-            if not name.startswith("layers.") or int(name.split(".")[1]) < num_layers
-        )
+
+        # The trailing layers belong to the MTP draft model, `mtp.*` to a
+        # bundled draft model.
+        def is_target(name: str) -> bool:
+            if name.startswith("mtp."):
+                return False
+            return not name.startswith("layers.") or (
+                int(name.split(".")[1]) < num_layers
+            )
+
+        weights = ((name, w) for name, w in weights if is_target(name))
         return load_ernie5_5_weights(self, weights, self.get_expert_mapping())
 
     def get_expert_mapping(self) -> list[tuple[str, str, int, str]]:
