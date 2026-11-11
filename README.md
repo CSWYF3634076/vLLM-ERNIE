@@ -6,17 +6,16 @@
 
 vLLM plugin for ERNIE models, one package per model under
 `src/vllm_ernie/models/`. It currently serves ERNIE 5.5
-(`Ernie5_5_MoeForCausalLM`: HCA + MLA-DSA, mHC, MoE), base and chat
-checkpoints, with ECHO (MTP) and DSpark speculative decoding, the ERNIE chat
-renderer and the `ernie5` reasoning / tool-call parsers. It runs on
+(`Ernie5_5_MoeForCausalLM`: HCA + MLA-DSA, mHC, MoE), with ECHO (MTP) and DSpark
+speculative decoding and the `ernie5` reasoning / tool-call parsers. It runs on
 the released vLLM **0.32.0** wheel, unmodified, on NVIDIA GPUs only.
 
 ## Supported Models
 
 | Model | Weights | Use |
 |---|---|---|
-| ERNIE-5.5-Flash-Base | [FP8](https://huggingface.co/baidu/ERNIE-5.5-Flash-Base) / [BF16](https://huggingface.co/baidu/ERNIE-5.5-Flash-Base-BF16) | Base model, completions, ECHO |
-| ERNIE-5.5-Flash-Preview | [FP4](https://huggingface.co/baidu/ERNIE-5.5-Flash-Preview) / [FP8](https://huggingface.co/baidu/ERNIE-5.5-Flash-Preview-FP8) / [BF16](https://huggingface.co/baidu/ERNIE-5.5-Flash-Preview-BF16) | Chat, reasoning, tool calling, DSpark |
+| ERNIE-5.5-Flash-Base | [FP8](https://huggingface.co/baidu/ERNIE-5.5-Flash-Base) / [BF16](https://huggingface.co/baidu/ERNIE-5.5-Flash-Base-BF16) | Base model, completions. Released |
+| ERNIE-5.5-Flash | FP8 / FP4 / BF16 | Chat, reasoning, tool calling, DSpark. Coming soon |
 
 Set `VLLM_USE_MODELSCOPE=True` to download from
 [ModelScope](https://www.modelscope.cn/models/baidu/ERNIE-5.5-Flash-Base); the
@@ -45,8 +44,6 @@ Inference supports up to 1,048,576 tokens.
 - **MultiMax Output Head.** with a learnable piece-wise temperature.
 - **ECHO.** The final layer, trained to predict future tokens, doubles as a
   built-in draft; vLLM runs it through its MTP path.
-- **DSpark.** The chat models bundle a 3-layer DSpark draft, conditioned on
-  the target's last 3 layers, that proposes a block of 7 tokens per step.
 
 ## Install
 
@@ -69,109 +66,25 @@ Attention runs data parallel and the MoE expert parallel
 (`--data-parallel-size N --enable-expert-parallel`); attention tensor
 parallelism (`--tensor-parallel-size` 2, 4 or 8) also works, see Configuration
 Tips. The commands below are for one 4-GPU node and use the 128K training
-context (`--max-model-len 131072`), with speculative decoding on: DSpark for
-the chat models, ECHO (MTP) for the Base models. The smallest GPU counts
-that hold the weights:
+context (`--max-model-len 131072`), with ECHO (MTP) speculative decoding on.
+The smallest GPU counts that hold the weights:
 
-| GPU memory | FP4 (~155 GB weights) | FP8 (~280 GB weights) | BF16 (~560 GB weights) |
-|---|---|---|---|
-| 288 GB | 1 GPU | 2 GPUs | 4 GPUs |
-| 192 GB | 2 GPUs | 4 GPUs | 8 GPUs (or 2 nodes × 4 GPUs) |
-| 80 GB | 4 GPUs | 8 GPUs | 2 nodes × 8 GPUs |
+| GPU memory | FP8 (~280 GB weights) | BF16 (~560 GB weights) |
+|---|---|---|
+| 288 GB | 2 GPUs | 4 GPUs |
+| 192 GB | 4 GPUs | 8 GPUs (or 2 nodes × 4 GPUs) |
+| 80 GB | 8 GPUs | 2 nodes × 8 GPUs |
 
-For FP8 weights, `--moe-backend humming` is recommended on
-Blackwell-architecture GPUs; without it vLLM uses its default MoE kernel. On
-Hopper-architecture GPUs, keep the default. On 80 GB GPUs, serve FP8 on 8
-GPUs with `--data-parallel-size 8` and `--gpu-memory-utilization 0.93`; up to
+The FP8 commands pass `--moe-backend humming`, which supports SiTU with FP8
+weights on Blackwell-architecture GPUs. On Hopper-architecture GPUs, drop it
+and keep vLLM's default MoE kernel. On 80 GB GPUs, serve FP8 on 8 GPUs with
+`--data-parallel-size 8` and `--gpu-memory-utilization 0.93`; up to
 `--max-model-len 262144` fits, 1M does not.
 
+The commands bind `0.0.0.0` without authentication; add `--api-key <key>` or
+bind `127.0.0.1` unless the network is trusted.
 
-### ERNIE-5.5-Flash-Preview
-
-The chat models need `--trust-remote-code`.
-
-#### FP4
-
-```bash
-export VLLM_ENGINE_READY_TIMEOUT_S=3600
-vllm serve baidu/ERNIE-5.5-Flash-Preview \
-    --trust-remote-code \
-    --host 0.0.0.0 \
-    --port 8000 \
-    --data-parallel-size 4 \
-    --enable-expert-parallel \
-    --kv-cache-dtype fp8 \
-    --max-model-len 131072 \
-    --reasoning-parser ernie5 \
-    --tool-call-parser ernie5 \
-    --enable-auto-tool-choice \
-    --attention-config '{"indexer_kv_dtype":"mxfp4"}' \
-    --speculative-config '{"method":"dspark","num_speculative_tokens":7,"draft_sample_method":"probabilistic"}'
-```
-
-#### FP8
-
-`--moe-backend humming` is recommended.
-
-```bash
-export VLLM_ENGINE_READY_TIMEOUT_S=3600
-vllm serve baidu/ERNIE-5.5-Flash-Preview-FP8 \
-    --trust-remote-code \
-    --host 0.0.0.0 \
-    --port 8000 \
-    --data-parallel-size 4 \
-    --enable-expert-parallel \
-    --moe-backend humming \
-    --kv-cache-dtype fp8 \
-    --max-model-len 131072 \
-    --reasoning-parser ernie5 \
-    --tool-call-parser ernie5 \
-    --enable-auto-tool-choice \
-    --speculative-config '{"method":"dspark","num_speculative_tokens":7,"draft_sample_method":"probabilistic"}'
-```
-
-#### BF16
-
-Same layout as the Base BF16 weights: run on the first node, and
-on the second node add `--data-parallel-start-rank 4`.
-
-```bash
-export VLLM_ENGINE_READY_TIMEOUT_S=3600
-export GLOO_SOCKET_IFNAME=${IFACE_NAME}
-export NCCL_SOCKET_IFNAME=${IFACE_NAME}
-vllm serve baidu/ERNIE-5.5-Flash-Preview-BF16 \
-    --trust-remote-code \
-    --host 0.0.0.0 \
-    --port 8000 \
-    --data-parallel-size 8 \
-    --data-parallel-size-local 4 \
-    --data-parallel-address ${HEAD_IP} \
-    --data-parallel-hybrid-lb \
-    --enable-expert-parallel \
-    --kv-cache-dtype fp8 \
-    --max-model-len 131072 \
-    --reasoning-parser ernie5 \
-    --tool-call-parser ernie5 \
-    --enable-auto-tool-choice \
-    --speculative-config '{"method":"dspark","num_speculative_tokens":7,"draft_sample_method":"probabilistic"}'
-```
-
-The chat models use DSpark speculative decoding. Drop
-`--speculative-config` to serve without a draft.
-
-The FP4 command passes `--attention-config '{"indexer_kv_dtype":"mxfp4"}'`,
-which keeps the DSA indexer's query and key cache in MXFP4. It needs
-Blackwell-architecture data-center GPUs and the default context parallel
-sizes; elsewhere, drop it to keep the FP8 indexer.
-
-Thinking is returned in `reasoning_content`, the answer in `content` and tool
-calls in `message.tool_calls`. Thinking is on by default; pass
-`"chat_template_kwargs": {"enable_thinking": false}` in a request to turn it
-off. `"parallel_tool_calls": false` limits a response to one tool call.
-
-### ERNIE-5.5-Flash-Base
-
-#### FP8
+### FP8
 
 ```bash
 export VLLM_ENGINE_READY_TIMEOUT_S=3600
@@ -189,7 +102,7 @@ vllm serve baidu/ERNIE-5.5-Flash-Base \
 Drop `--speculative-config` to serve without a draft. ECHO drafts 2 steps
 here; 1 or 3 also work.
 
-#### BF16
+### BF16
 
 BF16 runs on two 4-GPU nodes (DP8 + EP8). Set `HEAD_IP` to the first node's
 address and `IFACE_NAME` to the network interface between the nodes, then run
@@ -217,6 +130,19 @@ One 4-GPU node also holds the BF16 weights, but leaves little room for the KV
 cache: there, pass `--gpu-memory-utilization 0.95`, `--max-model-len 65536`,
 `--max-num-seqs 16`, `--max-num-batched-tokens 8192` and
 `--max-cudagraph-capture-size 512` instead.
+
+### DSpark (ERNIE-5.5-Flash, Coming Soon)
+
+The ERNIE-5.5-Flash model bundles a DSpark draft; the Base models
+carry none. Replace the ECHO `--speculative-config` with:
+
+```bash
+    --speculative-config '{"method":"dspark","draft_sample_method":"probabilistic"}'
+```
+
+The draft length comes from the model's block size, so the config leaves
+out `num_speculative_tokens`. vLLM's default `draft_sample_method` is `greedy`;
+the command uses `probabilistic`.
 
 ### 1M Context
 
@@ -295,10 +221,25 @@ vllm-router \
 ```
 
 P serves the Mooncake bootstrap on port 8998. With speculative decoding, pass
-the same `--speculative-config` to both nodes. For the chat models, also
-pass `--trust-remote-code` and the parser flags to both nodes. The `model`
-field of each request must match the served model name; otherwise the request
-fails mid-stream instead of returning a 404.
+the same `--speculative-config` to both nodes. The `model` field of each request must
+match the served model name; otherwise the request fails mid-stream instead
+of returning a 404.
+
+### Reasoning and Tool Calling (ERNIE-5.5-Flash, Coming Soon)
+
+For ERNIE-5.5-Flash (the Base models have no chat training), add to the
+`vllm serve` command:
+
+```bash
+    --reasoning-parser ernie5 \
+    --tool-call-parser ernie5 \
+    --enable-auto-tool-choice
+```
+
+Thinking is returned in `reasoning_content`, the answer in `content` and tool
+calls in `message.tool_calls`. Thinking is on by default; pass
+`"chat_template_kwargs": {"enable_thinking": false}` in a request to turn it
+off.
 
 ### KV Cache Offload
 
@@ -335,20 +276,6 @@ The completion text in the response is ` 36`. For the BF16 weights, set
 `"model"` to `baidu/ERNIE-5.5-Flash-Base-BF16`. The tokenizer prepends `<|ERNIE_MASK|>`
 (id 2) to completions prompts itself; do not add it to the prompt.
 
-The chat models take messages at `/v1/chat/completions`.
-Their `generation_config.json` sets `temperature=1.0` and `top_p=0.95`, which
-vLLM applies when a request leaves them out.
-
-```bash
-curl http://127.0.0.1:8000/v1/chat/completions \
-    -H 'Content-Type: application/json' \
-    -d '{
-        "model": "baidu/ERNIE-5.5-Flash-Preview",
-        "messages": [{"role": "user", "content": "What is 15% of 240?"}],
-        "max_tokens": 4096
-    }'
-```
-
 ## Configuration Tips
 
 - **Parallelism.** Data parallel attention with `--data-parallel-size` and
@@ -356,8 +283,8 @@ curl http://127.0.0.1:8000/v1/chat/completions \
   throughput. Attention tensor parallelism (`--tensor-parallel-size`, which
   must divide 8) lowers latency at low concurrency; the single KV head is
   replicated on every rank of the TP group, so it holds less KV cache.
-- **MoE kernel.** For FP8 weights, `--moe-backend humming` is recommended
-  on Blackwell-architecture GPUs. On Hopper-architecture GPUs, keep vLLM's
+- **MoE kernel.** The FP8 commands pass `--moe-backend humming`, which
+  supports SiTU with FP8 weights. On Hopper-architecture GPUs, keep vLLM's
   default.
 - **Long context.** The commands pass `--max-model-len 131072`, the 128K
   training length. The model allows 1,048,576: pass
