@@ -257,3 +257,50 @@ def test_parallel_tool_calls_false_reaches_template(
 
     kwargs = request.build_chat_params(None, "auto").chat_template_kwargs
     assert kwargs.get("options") == expected
+
+
+@pytest.mark.parametrize(
+    ("serving_ernie5", "user_kwargs", "expected"),
+    [
+        # ERNIE: reasoning_effort no longer implies enable_thinking.
+        (True, None, None),
+        # An explicit user value is kept.
+        (True, {"enable_thinking": False}, False),
+        # Other models keep vLLM's derived value.
+        (False, None, False),
+    ],
+)
+def test_reasoning_effort_does_not_set_enable_thinking(
+    monkeypatch, serving_ernie5, user_kwargs, expected
+):
+    from vllm.entrypoints.openai.chat_completion.protocol import (
+        ChatCompletionRequest,
+    )
+    from vllm.entrypoints.openai.responses.protocol import ResponsesRequest
+
+    from vllm_ernie.models.ernie5_5 import patches
+
+    monkeypatch.setattr(patches, "_serving_ernie5", serving_ernie5)
+    requests = [
+        ChatCompletionRequest(
+            messages=[{"role": "user", "content": "hi"}],
+            model="m",
+            reasoning_effort="none",
+            chat_template_kwargs=user_kwargs,
+        ),
+        ResponsesRequest(
+            input="hi",
+            model="m",
+            reasoning={"effort": "none"},
+            chat_template_kwargs=user_kwargs,
+        ),
+    ]
+    for request in requests:
+        params = request.build_chat_params(None, "auto")
+        assert params.chat_template_kwargs.get("enable_thinking") == expected
+        assert params.chat_template_kwargs["reasoning_effort"] == "none"
+        # A server default is no longer overridden by the derived value.
+        merged = params.with_defaults({"enable_thinking": True})
+        assert merged.chat_template_kwargs["enable_thinking"] == (
+            True if expected is None else expected
+        )

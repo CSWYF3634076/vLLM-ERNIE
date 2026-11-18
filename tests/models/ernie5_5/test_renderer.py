@@ -96,12 +96,17 @@ def test_registered_for_tokenizer_mode():
     ],
 )
 def test_ernie_renderer_is_default(monkeypatch, model_type, mode, expected):
+    from vllm_ernie.models.ernie5_5 import patches
+
+    # Restored at teardown, so the flag set below does not leak.
+    monkeypatch.setattr(patches, "_serving_ernie5", False)
     monkeypatch.setattr(
         RENDERER_REGISTRY, "load_renderer_cls", lambda m: lambda config, tok: m
     )
     config = MagicMock()
     config.model_config.hf_config.model_type = model_type
     assert RENDERER_REGISTRY.load_renderer(mode, config, None) == expected
+    assert patches._serving_ernie5 == (model_type == "ernie5_5_moe")
 
 
 def test_uses_python_chat_unless_template_is_explicit():

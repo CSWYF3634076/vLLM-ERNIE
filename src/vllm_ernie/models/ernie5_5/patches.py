@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Hooks that patch shared vLLM code for ERNIE 5.5."""
 
+import dataclasses
 import functools
 import inspect
 from typing import Literal, get_args
@@ -21,6 +22,9 @@ ERNIE5_BREAKABLE_CUDAGRAPH_ARCHITECTURES = (
 )
 
 _applied = False
+# Set once this process loads a renderer for ERNIE 5.5. Request-level hooks
+# such as build_chat_params see no model config, so they read this instead.
+_serving_ernie5 = False
 
 
 def _patch_config_registry() -> None:
@@ -194,11 +198,11 @@ def _register_renderer() -> None:
 
     @functools.wraps(orig)
     def load_renderer(self, renderer_mode, config, tokenizer):
-        if (
-            renderer_mode == "hf"
-            and config.model_config.hf_config.model_type == ERNIE5_MODEL_TYPE
-        ):
-            renderer_mode = ERNIE5_TOKENIZER_MODE
+        global _serving_ernie5
+        if config.model_config.hf_config.model_type == ERNIE5_MODEL_TYPE:
+            _serving_ernie5 = True
+            if renderer_mode == "hf":
+                renderer_mode = ERNIE5_TOKENIZER_MODE
         return orig(self, renderer_mode, config, tokenizer)
 
     load_renderer._ernie5_default_renderer = True  # type: ignore[attr-defined]
@@ -237,6 +241,51 @@ def _patch_parallel_tool_calls() -> None:
 
     preprocess_chat._ernie5_parallel_tool_calls = True  # type: ignore[attr-defined]
     OnlineRenderer.preprocess_chat = preprocess_chat
+
+
+def _without_injected_enable_thinking(orig):
+    """Keep ``enable_thinking`` out of the kwargs unless the user set it.
+
+    vLLM derives ``enable_thinking = reasoning_effort != "none"`` for templates
+    that need an explicit opt-in. ERNIE 5.5 thinks by default and renders
+    ``reasoning_effort`` itself, so the derived value would turn ``"none"``
+    into thinking off and override ``--default-chat-template-kwargs``.
+    The renderer and the reasoning parser read these same kwargs.
+    """
+    if getattr(orig, "_ernie5_enable_thinking", False):
+        return orig
+
+    @functools.wraps(orig)
+    def build_chat_params(self, *args, **kwargs):
+        params = orig(self, *args, **kwargs)
+        template_kwargs = params.chat_template_kwargs
+        if (
+            not _serving_ernie5
+            or "enable_thinking" not in template_kwargs
+            or "enable_thinking" in (self.chat_template_kwargs or {})
+        ):
+            return params
+        return dataclasses.replace(
+            params,
+            chat_template_kwargs={
+                k: v for k, v in template_kwargs.items() if k != "enable_thinking"
+            },
+        )
+
+    build_chat_params._ernie5_enable_thinking = True  # type: ignore[attr-defined]
+    return build_chat_params
+
+
+def _patch_enable_thinking() -> None:
+    from vllm.entrypoints.openai.chat_completion.protocol import (
+        ChatCompletionRequest,
+    )
+    from vllm.entrypoints.openai.responses.protocol import ResponsesRequest
+
+    for cls in (ChatCompletionRequest, ResponsesRequest):
+        cls.build_chat_params = _without_injected_enable_thinking(
+            cls.build_chat_params
+        )
 
 
 _MOONCAKE = "MooncakeConnector"
@@ -319,4 +368,5 @@ def apply_patches() -> None:
     _register_parsers()
     _register_renderer()
     _patch_parallel_tool_calls()
+    _patch_enable_thinking()
     _patch_mooncake_connector()
