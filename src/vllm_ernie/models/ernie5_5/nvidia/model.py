@@ -9,7 +9,7 @@ from itertools import islice
 import torch
 from torch import nn
 
-from vllm.config import VllmConfig
+from vllm.config import VllmConfig, get_current_vllm_config
 from vllm.distributed import (
     get_pp_group,
     get_tensor_model_parallel_rank,
@@ -44,6 +44,7 @@ from vllm.model_executor.models.utils import (
     spec_decode_needs_target_embed,
 )
 from vllm.sequence import IntermediateTensors
+from vllm.triton_utils import tl, triton
 
 from vllm_ernie.models.ernie5_5.config import Ernie5_5Config
 from vllm_ernie.models.ernie5_5.mhc import (
@@ -82,6 +83,30 @@ def topk_buffers(
 Ernie5_5AuxOutput = tuple[torch.Tensor, list[torch.Tensor]]
 
 
+@triton.jit
+def _relu(x):
+    # torch.relu: NaN stays NaN, -0.0 becomes +0.0.
+    return tl.where(x <= 0, 0.0, x)
+
+
+@triton.jit
+def _multimax_kernel(logits_ptr, ranges_ptr, ts_ptr, stride, V, BLOCK: tl.constexpr):
+    offs = tl.program_id(1) * BLOCK + tl.arange(0, BLOCK)
+    mask = offs < V
+    ptrs = logits_ptr + tl.program_id(0).to(tl.int64) * stride + offs
+    x = tl.load(ptrs, mask=mask)
+    a = _relu(tl.load(ranges_ptr) - x)
+    b = _relu(x - tl.load(ranges_ptr + 1))
+    c = _relu(tl.load(ranges_ptr + 2) - x)
+    d = _relu(x - tl.load(ranges_ptr + 3))
+    # Same op order as the torch expression in multimax.
+    y = x + tl.load(ts_ptr) * a
+    y = y + tl.load(ts_ptr + 1) * b
+    y = y + tl.load(ts_ptr + 2) * (c * c)
+    y = y + tl.load(ts_ptr + 3) * (d * d)
+    tl.store(ptrs, y, mask=mask)
+
+
 class Ernie5_5ParallelLMHead(ParallelLMHead):
     """lm_head that also owns the learned multimax applied to its logits."""
 
@@ -91,7 +116,29 @@ class Ernie5_5ParallelLMHead(ParallelLMHead):
         self.register_buffer("multimax_ts", torch.zeros(4, dtype=torch.float32))
 
     def multimax(self, logits: torch.Tensor) -> torch.Tensor:
+        """Apply multimax; fp32 CUDA logits are updated in place."""
         r, t = self.multimax_ranges, self.multimax_ts
+        if (
+            logits.is_cuda
+            and logits.dtype == torch.float32
+            and logits.dim() == 2
+            and logits.stride(1) == 1
+        ):
+            num_tokens, vocab = logits.shape
+            if num_tokens and vocab:
+                block = 2048
+                _multimax_kernel[(num_tokens, triton.cdiv(vocab, block))](
+                    logits,
+                    r,
+                    t,
+                    logits.stride(0),
+                    vocab,
+                    BLOCK=block,
+                    num_warps=4,
+                    # No FMA contraction, so each op rounds like torch's.
+                    enable_fp_fusion=False,
+                )
+            return logits
         return (
             logits
             + t[0] * (r[0] - logits).relu()
@@ -141,7 +188,10 @@ class Ernie5_5DecoderLayer(nn.Module):
             )
         else:
             self.ffn = Ernie5_5MoE(
-                config, quant_config=quant_config, prefix=f"{prefix}.ffn"
+                config,
+                quant_config=quant_config,
+                prefix=f"{prefix}.ffn",
+                aux_stream=aux_stream_list[0] if aux_stream_list else None,
             )
 
         self.attn_norm = RMSNorm(self.hidden_size, self.rms_norm_eps)
@@ -461,12 +511,15 @@ class Ernie5_5Model(nn.Module, EagleModelMixin):
 def ernie5_5_expert_mapping(
     model: nn.Module, config: Ernie5_5Config
 ) -> list[tuple[str, str, int, str]]:
+    # EPLB redundant experts load the checkpoint weights of their logical ids.
+    eplb_config = get_current_vllm_config().parallel_config.eplb_config
     return fused_moe_make_expert_params_mapping(
         model,
         ckpt_gate_proj_name="w1",
         ckpt_down_proj_name="w2",
         ckpt_up_proj_name="w3",
         num_experts=config.n_routed_experts,
+        num_redundant_experts=eplb_config.num_redundant_experts,
     )
 
 
@@ -654,6 +707,21 @@ ernie5_5_mapper = WeightsMapper(
 class Ernie5_5MixtureOfExperts(MixtureOfExperts):
     moe_mlp_layers: list[Ernie5_5MoE]
 
+    def set_moe_parameters(self, layers: Iterable[nn.Module]) -> None:
+        self.num_expert_groups = 1
+        self.moe_layers: list[nn.Module] = []
+        self.moe_mlp_layers = []
+        for layer in layers:
+            if isinstance(layer, Ernie5_5DecoderLayer) and isinstance(
+                layer.ffn, Ernie5_5MoE
+            ):
+                self.moe_mlp_layers.append(layer.ffn)
+                self.moe_layers.append(layer.ffn.experts)
+        self.num_moe_layers = len(self.moe_layers)
+        self.extract_moe_parameters(
+            self.moe_mlp_layers[0] if self.moe_mlp_layers else None
+        )
+
     def extract_moe_parameters(self, example_moe: Ernie5_5MoE | None) -> None:
         if example_moe is None:
             self.num_moe_layers = 0
@@ -718,22 +786,7 @@ class Ernie5_5ForCausalLM(
         self.make_empty_intermediate_tensors = (  # type: ignore[method-assign]
             self.model.make_empty_intermediate_tensors
         )
-        self.set_moe_parameters()
-
-    def set_moe_parameters(self) -> None:
-        self.num_expert_groups = 1
-        self.moe_layers: list[nn.Module] = []
-        self.moe_mlp_layers: list[Ernie5_5MoE] = []
-        for layer in self.model.layers:
-            if isinstance(layer, Ernie5_5DecoderLayer) and isinstance(
-                layer.ffn, Ernie5_5MoE
-            ):
-                self.moe_mlp_layers.append(layer.ffn)
-                self.moe_layers.append(layer.ffn.experts)
-        self.num_moe_layers = len(self.moe_layers)
-        self.extract_moe_parameters(
-            self.moe_mlp_layers[0] if self.moe_mlp_layers else None
-        )
+        self.set_moe_parameters(self.model.layers)
 
     def embed_input_ids(self, input_ids: torch.Tensor) -> torch.Tensor:
         return self.model.embed_input_ids(input_ids)

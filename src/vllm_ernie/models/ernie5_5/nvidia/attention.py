@@ -10,6 +10,7 @@ from typing import cast
 import torch
 from torch import nn
 
+import vllm.envs as envs
 from vllm import _custom_ops as ops
 from vllm.compilation.breakable_cudagraph import eager_break_during_capture
 from vllm.config import CacheConfig, VllmConfig, get_current_vllm_config
@@ -22,6 +23,7 @@ from vllm.distributed import (
 from vllm.forward_context import get_forward_context
 from vllm.logger import init_logger
 from vllm.model_executor.layers.attention import MLAAttention
+from vllm.model_executor.layers.fusion.quant_activation import QuantizedActivation
 from vllm.model_executor.layers.layernorm import LayerNorm, RMSNorm
 from vllm.model_executor.layers.linear import (
     ColumnParallelLinear,
@@ -34,6 +36,9 @@ from vllm.model_executor.layers.quantization.utils.fp8_utils import (
     per_token_group_quant_fp8,
 )
 from vllm.model_executor.layers.quantization.utils.mxfp4_utils import downcast_to_mxfp
+from vllm.model_executor.layers.quantization.utils.quant_utils import (
+    kFp8Dynamic128Sym,
+)
 from vllm.model_executor.layers.rotary_embedding import get_rope
 from vllm.model_executor.layers.sparse_attn_indexer import SparseAttnIndexer
 from vllm.model_executor.models.deepseek_v2 import DeepseekV32IndexerCache
@@ -48,8 +53,14 @@ from vllm.models.deepseek_v4.nvidia.flashmla import DeepseekV4FlashMLAAttention
 from vllm.models.deepseek_v4.nvidia.ops.o_proj import deep_gemm_fp8_o_proj
 from vllm.platforms import current_platform
 from vllm.triton_utils import tl, triton
-from vllm.utils.deep_gemm import get_paged_mqa_logits_metadata, has_deep_gemm
+from vllm.utils.deep_gemm import (
+    DeepGemmQuantScaleFMT,
+    get_paged_mqa_logits_metadata,
+    get_tma_aligned_size,
+    has_deep_gemm,
+)
 from vllm.utils.math_utils import round_up
+from vllm.utils.multi_stream_utils import maybe_execute_in_parallel
 from vllm.v1.attention.backend import (
     AttentionBackend,
     AttentionType,
@@ -152,6 +163,238 @@ def fold_vha(model: nn.Module) -> None:
             module.fold()
 
 
+@triton.jit
+def _vha_inv_rope_quant_kernel(
+    o_ptr,
+    m_ptr,
+    positions_ptr,
+    cos_sin_ptr,
+    out_ptr,
+    scale_ptr,
+    num_tokens,
+    o_stride_token,
+    o_stride_head,
+    cache_stride_pos,
+    out_stride_group,
+    scale_stride_group,
+    scale_stride_k,
+    NUM_HEADS: tl.constexpr,
+    HEADS_PER_GROUP: tl.constexpr,
+    HEAD_DIM: tl.constexpr,
+    NOPE_DIM: tl.constexpr,
+    HALF_ROPE: tl.constexpr,
+    BLOCK: tl.constexpr,
+    FP8_MAX: tl.constexpr,
+):
+    # One program per (token, 128-wide chunk of every head).
+    tok = tl.program_id(0).to(tl.int64)
+    chunk = tl.program_id(1)
+    heads = tl.arange(0, NUM_HEADS)
+    group = heads // HEADS_PER_GROUP
+    head_in_group = heads % HEADS_PER_GROUP
+    # Byte `chunk` of each head's packed int32 UE8M0 scale (little endian).
+    scale_idx = group * scale_stride_group + head_in_group * scale_stride_k + tok
+    scale_bytes = scale_ptr + scale_idx * 4 + chunk
+    if tok >= num_tokens:
+        # TMA-aligned padding rows of the scale buffer.
+        tl.store(scale_bytes, tl.zeros((NUM_HEADS,), dtype=tl.uint8))
+        return
+    cols = chunk * BLOCK + tl.arange(0, BLOCK)
+    x = tl.load(
+        o_ptr + tok * o_stride_token + heads[:, None] * o_stride_head + cols[None, :]
+    )
+    mix = tl.load(m_ptr + heads[:, None] * NUM_HEADS + heads[None, :])
+    # Head mixing with fp32 accumulation, then inverse RoPE on interleaved pairs.
+    y = tl.dot(mix.to(x.dtype), x, out_dtype=tl.float32)
+    if chunk * BLOCK + BLOCK > NOPE_DIM:
+        rope = chunk * (BLOCK // 2) + tl.arange(0, BLOCK // 2) - NOPE_DIM // 2
+        is_rope = rope >= 0
+        pos = tl.load(positions_ptr + tok)
+        cs = cos_sin_ptr + pos * cache_stride_pos + tl.maximum(rope, 0)
+        cos = tl.load(cs, mask=is_rope, other=1.0)[None, :]
+        sin = tl.load(cs + HALF_ROPE, mask=is_rope, other=0.0)[None, :]
+        y_even, y_odd = tl.split(tl.reshape(y, (NUM_HEADS, BLOCK // 2, 2)))
+        y = tl.reshape(
+            tl.join(y_even * cos + y_odd * sin, y_odd * cos - y_even * sin),
+            (NUM_HEADS, BLOCK),
+        )
+    # Per-(head, 128) UE8M0 scale, as fused_inv_rope_fp8_quant.
+    amax = tl.maximum(tl.max(tl.abs(y), axis=1), 1e-10)
+    scale = tl.math.exp2(tl.ceil(tl.log2(amax * (1.0 / FP8_MAX))))
+    y_q = tl.clamp(y / scale[:, None], -FP8_MAX, FP8_MAX)
+    out_rows = out_ptr + group * out_stride_group + tok * HEADS_PER_GROUP * HEAD_DIM
+    out_rows += head_in_group * HEAD_DIM
+    tl.store(out_rows[:, None] + cols[None, :], y_q.to(tl.float8e4nv))
+    exp_byte = (scale.to(tl.int32, bitcast=True) >> 23) & 0xFF
+    tl.store(scale_bytes, exp_byte.to(tl.uint8))
+
+
+def vha_inv_rope_fp8_quant(
+    o: torch.Tensor,
+    mix: torch.Tensor,
+    positions: torch.Tensor,
+    cos_sin_cache: torch.Tensor,
+    n_groups: int,
+    nope_dim: int,
+    rope_dim: int,
+) -> QuantizedActivation:
+    """VHA head mixing + `fused_inv_rope_fp8_quant` (SM100 layout) in one kernel."""
+    num_tokens, num_heads, head_dim = o.shape
+    block = 128
+    heads_per_group = num_heads // n_groups
+    assert head_dim == nope_dim + rope_dim and head_dim == 4 * block
+    assert o.stride(-1) == 1 and nope_dim % 2 == 0
+    width = heads_per_group * head_dim
+    out = torch.empty(
+        (n_groups, num_tokens, width), dtype=torch.float8_e4m3fn, device=o.device
+    )
+    aligned = get_tma_aligned_size(num_tokens, torch.int32.itemsize)
+    scale = torch.empty(
+        (n_groups, heads_per_group, aligned), dtype=torch.int32, device=o.device
+    )
+    if aligned:
+        _vha_inv_rope_quant_kernel[(aligned, head_dim // block)](
+            o,
+            mix,
+            positions,
+            cos_sin_cache,
+            out,
+            scale.view(torch.uint8),
+            num_tokens,
+            o.stride(0),
+            o.stride(1),
+            cos_sin_cache.stride(0),
+            out.stride(0),
+            scale.stride(0),
+            scale.stride(1),
+            NUM_HEADS=num_heads,
+            HEADS_PER_GROUP=heads_per_group,
+            HEAD_DIM=head_dim,
+            NOPE_DIM=nope_dim,
+            HALF_ROPE=rope_dim // 2,
+            BLOCK=block,
+            FP8_MAX=torch.finfo(torch.float8_e4m3fn).max,
+            num_warps=4,
+        )
+    return QuantizedActivation(
+        data=out.transpose(0, 1),
+        scale=scale.permute(2, 0, 1)[:num_tokens],
+        orig_dtype=o.dtype,
+        orig_shape=out.transpose(0, 1).shape,
+        quant_key=kFp8Dynamic128Sym,
+    )
+
+
+@triton.jit
+def _sigmoid_mul_quant_kernel(
+    x_ptr,
+    gate_ptr,
+    out_ptr,
+    scale_ptr,
+    num_rows,
+    x_stride,
+    gate_stride,
+    scale_stride_k,
+    HIDDEN: tl.constexpr,
+    BLOCK: tl.constexpr,
+    BLOCK_M: tl.constexpr,
+    FP8_MAX: tl.constexpr,
+):
+    # One program per (BLOCK_M rows, 4 quant groups = one packed scale int32).
+    rows = tl.program_id(1) * BLOCK_M + tl.arange(0, BLOCK_M)
+    row_mask = rows < num_rows
+    rows = rows.to(tl.int64)
+    cols = tl.program_id(0) * 4 * BLOCK + tl.arange(0, 4 * BLOCK)
+    mask = row_mask[:, None] & (cols < HIDDEN)[None, :]
+    x = tl.load(x_ptr + rows[:, None] * x_stride + cols[None, :], mask=mask, other=0.0)
+    g = tl.load(
+        gate_ptr + rows[:, None] * gate_stride + cols[None, :], mask=mask, other=0.0
+    )
+    # Same bf16 roundings as `x * torch.sigmoid(gate)`.
+    s = tl.sigmoid(g.to(tl.float32)).to(x.dtype).to(tl.float32)
+    y = (x.to(tl.float32) * s).to(x.dtype).to(tl.float32)
+    y = tl.reshape(y, (BLOCK_M, 4, BLOCK))
+    amax = tl.maximum(tl.max(tl.abs(y), axis=2), 1e-10)
+    exponent = tl.ceil(tl.log2(amax * (1.0 / FP8_MAX)))
+    y_q = tl.clamp(y * tl.math.exp2(-exponent)[:, :, None], -FP8_MAX, FP8_MAX)
+    tl.store(
+        out_ptr + rows[:, None] * HIDDEN + cols[None, :],
+        tl.reshape(y_q, (BLOCK_M, 4 * BLOCK)).to(out_ptr.dtype.element_ty),
+        mask=mask,
+    )
+    shifts = tl.arange(0, 4) * 8
+    packed = tl.sum((exponent.to(tl.int32) + 127) << shifts[None, :], axis=1)
+    tl.store(scale_ptr + tl.program_id(0) * scale_stride_k + rows, packed, row_mask)
+
+
+def sigmoid_mul_quant_fp8(
+    x: torch.Tensor, gate: torch.Tensor
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """``x * sigmoid(gate)`` as 1x128 UE8M0 FP8 with DeepGEMM-packed scales."""
+    block = 128
+    num_rows, hidden = x.shape
+    assert gate.shape == x.shape and hidden % (4 * block) == 0
+    assert x.stride(-1) == 1 and gate.stride(-1) == 1
+    out = torch.empty((num_rows, hidden), dtype=torch.float8_e4m3fn, device=x.device)
+    packs = hidden // (4 * block)
+    aligned = get_tma_aligned_size(num_rows, torch.int32.itemsize)
+    scale = torch.empty_strided(
+        (num_rows, packs), (1, aligned), dtype=torch.int32, device=x.device
+    )
+    block_m = 4
+    if num_rows:
+        _sigmoid_mul_quant_kernel[(packs, triton.cdiv(num_rows, block_m))](
+            x,
+            gate,
+            out,
+            scale,
+            num_rows,
+            x.stride(0),
+            gate.stride(0),
+            scale.stride(1),
+            HIDDEN=hidden,
+            BLOCK=block,
+            BLOCK_M=block_m,
+            FP8_MAX=torch.finfo(torch.float8_e4m3fn).max,
+            num_warps=4,
+        )
+    return out, scale
+
+
+class GatedDeepGemmLinear:
+    """``linear(x * sigmoid(gate))`` with the gate fused into the input FP8 quant."""
+
+    def __init__(self, linear: nn.Module, kernel) -> None:
+        self.linear = linear
+        self.kernel = kernel
+
+    @classmethod
+    def wrap(cls, linear: nn.Module) -> "GatedDeepGemmLinear | None":
+        from vllm.model_executor.kernels.linear.scaled_mm.deep_gemm import (
+            DeepGemmFp8BlockScaledMMKernel,
+        )
+
+        kernel = getattr(linear.quant_method, "fp8_linear", None)
+        # The fused quant writes packed int32 UE8M0 scales (SM100/SM120 only;
+        # Hopper takes float32 scales).
+        if (
+            get_tensor_model_parallel_world_size() != 1
+            or not isinstance(kernel, DeepGemmFp8BlockScaledMMKernel)
+            or not kernel.use_deep_gemm_e8m0
+            or DeepGemmQuantScaleFMT.from_oracle() != DeepGemmQuantScaleFMT.UE8M0
+            or linear.input_size % 512
+        ):
+            return None
+        return cls(linear, kernel)
+
+    def __call__(self, x: torch.Tensor, gate: torch.Tensor) -> torch.Tensor:
+        q, scale = sigmoid_mul_quant_fp8(x, gate)
+        params = self.kernel._get_layer_params(self.linear)
+        return self.kernel.apply_block_scaled_mm(
+            A=q, B=params.weight, As=scale, Bs=params.block_scale
+        )
+
+
 class Ernie5_5Compressor(DeepseekCompressor):
     """Keeps C128 compression in piecewise CUDA graphs (upstream #59709)."""
 
@@ -193,8 +436,37 @@ class Ernie5_5HCAAttentionMixin:
             prefix=f"{prefix}.o_gate",
         )
         self.vha = VHAPostMix(self.n_heads)
+        # One kernel for VHA + inverse RoPE + FP8 quant (TP=1, FP8 wo_a, SM100).
+        # Its tl.dot over heads needs a power-of-two head count >= 16.
+        num_heads = self.n_local_heads
+        self._fuse_vha_quant = (
+            self.vha.tp_size == 1
+            and self.wo_a.weight.dtype == torch.float8_e4m3fn
+            and self._tma_aligned_scales
+            and self._einsum_recipe[2] == 128
+            and self.head_dim == 512
+            and self.nope_head_dim + self.rope_head_dim == self.head_dim
+            and self.nope_head_dim % 2 == 0
+            and num_heads >= 16
+            and num_heads & (num_heads - 1) == 0
+            and num_heads % self.n_local_groups == 0
+        )
+        self._fused_wo_b = GatedDeepGemmLinear.wrap(self.wo_b)
         if getattr(self, "compressor", None) is not None:
             self.compressor.__class__ = Ernie5_5Compressor
+        # HCA has no indexer, so the gate runs on aux stream 1 during attention.
+        self.gate_events = [torch.cuda.Event(), torch.cuda.Event()]
+
+    def _gate(self, qr: torch.Tensor) -> torch.Tensor:
+        # The fused wo_b input quant applies the sigmoid itself.
+        if self._fused_wo_b is not None:
+            return self.o_gate(qr)
+        return torch.sigmoid(self.o_gate(qr))
+
+    def _gated_wo_b(self, gate: torch.Tensor):
+        if self._fused_wo_b is not None:
+            return lambda z: self._fused_wo_b(z, gate)
+        return lambda z: self.wo_b(z * gate)
 
     def forward(
         self,
@@ -212,27 +484,51 @@ class Ernie5_5HCAAttentionMixin:
             self._run_parallel_input_projections(hidden_states)
         )
         qr, qr_scale, kv = self._split_qkv_and_norm(qr_kv)
-        gate = self.o_gate(qr)
-        self._prepare_and_attn_fn(
-            hidden_states,
-            qr,
-            kv,
-            qr_scale,
-            kv_score,
-            indexer_kv_score,
-            indexer_weights,
-            positions,
-            o_padded,
+        aux_stream = None
+        if (
+            self.aux_stream_list is not None
+            and self.indexer is None
+            and num_tokens <= envs.VLLM_MULTI_STREAM_GEMM_TOKEN_THRESHOLD
+        ):
+            aux_stream = self.aux_stream_list[1]
+        _, gate = maybe_execute_in_parallel(
+            lambda: self._prepare_and_attn_fn(
+                hidden_states,
+                qr,
+                kv,
+                qr_scale,
+                kv_score,
+                indexer_kv_score,
+                indexer_weights,
+                positions,
+                o_padded,
+            ),
+            lambda: self._gate(qr),
+            self.gate_events[0],
+            self.gate_events[1],
+            aux_stream,
         )
         # VHA acts on the head axis and inverse RoPE on the dim axis, so
         # mixing before the fused inverse-RoPE o_proj is exact.
-        o = self.vha(o_padded[:, : self.n_local_heads, :])
+        o = o_padded[:, : self.n_local_heads, :]
+        if self._fuse_vha_quant:
+            o = vha_inv_rope_fp8_quant(
+                o,
+                self.vha.m,
+                positions,
+                self.rotary_emb.cos_sin_cache,
+                n_groups=self.n_local_groups,
+                nope_dim=self.nope_head_dim,
+                rope_dim=self.rope_head_dim,
+            )
+        else:
+            o = self.vha(o)
         return deep_gemm_fp8_o_proj(
             o,
             positions,
             self.rotary_emb.cos_sin_cache,
             self.wo_a,
-            lambda z: self.wo_b(z * torch.sigmoid(gate)),
+            self._gated_wo_b(gate),
             n_groups=self.n_local_groups,
             heads_per_group=self.n_local_heads // self.n_local_groups,
             nope_dim=self.nope_head_dim,
@@ -614,11 +910,15 @@ class Ernie5_5Indexer(nn.Module):
             prefix=f"{prefix}.wk_weights_proj",
         )
         self.k_norm = LayerNorm(self.head_dim, eps=1e-6)
+        # Partial RoPE on the leading rope_dim of each head.
         self.rotary_emb = get_rope(
-            self.rope_dim,
+            self.head_dim,
             max_position=config.max_position_embeddings,
             is_neox_style=True,
-            rope_parameters=config.mla_rope_parameters,
+            rope_parameters={
+                **config.mla_rope_parameters,
+                "partial_rotary_factor": self.rope_dim / self.head_dim,
+            },
         )
         # The hadacore transform is orthonormal, so only the usual softmax and
         # head-count scaling is folded into the weights.
@@ -661,12 +961,8 @@ class Ernie5_5Indexer(nn.Module):
         k, weights = kw.split([self.head_dim, self.n_head], dim=-1)
         k = self.k_norm(k)
 
-        nope_dim = self.head_dim - self.rope_dim
-        q_pe, q_nope = q.split([self.rope_dim, nope_dim], dim=-1)
-        k_pe, k_nope = k.split([self.rope_dim, nope_dim], dim=-1)
-        q_pe, k_pe = self.rotary_emb(positions, q_pe, k_pe.unsqueeze(1))
-        q = torch.cat([q_pe.reshape(-1, self.n_head, self.rope_dim), q_nope], -1)
-        k = torch.cat([k_pe.reshape(-1, self.rope_dim), k_nope], dim=-1)
+        # In place on CUDA, so no split + cat around the rope part.
+        q, k = self.rotary_emb(positions, q, k)
         q = hadamard_rows(q.view(-1, self.head_dim))
         k = hadamard_rows(k)
 
@@ -828,6 +1124,7 @@ class Ernie5_5DSAAttention(nn.Module):
             return_bias=False,
             prefix=f"{prefix}.o_gate",
         )
+        self._fused_wo_b = GatedDeepGemmLinear.wrap(self.wo_b)
         self.vha = VHAPostMix(self.num_heads)
         self.rotary_emb = get_rope(
             self.qk_rope_head_dim,
@@ -901,6 +1198,8 @@ class Ernie5_5DSAAttention(nn.Module):
             hidden_states, q_c, positions, q, kv_c_normed, k_pe, attn_out
         )
         o = self.vha(attn_out.view(num_tokens, self.num_local_heads, self.v_head_dim))
+        if self._fused_wo_b is not None:
+            return self._fused_wo_b(o.flatten(1), gate)
         return self.wo_b(o.flatten(1) * torch.sigmoid(gate))
 
     @eager_break_during_capture
