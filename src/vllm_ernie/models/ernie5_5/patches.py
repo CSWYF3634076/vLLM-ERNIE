@@ -25,6 +25,9 @@ _applied = False
 # Set once this process loads a renderer for ERNIE 5.5. Request-level hooks
 # such as build_chat_params see no model config, so they read this instead.
 _serving_ernie5 = False
+# Set once that renderer is Ernie5_5Renderer, which shows response_format to
+# the model.
+_renders_response_format = False
 
 
 def _patch_config_registry() -> None:
@@ -198,11 +201,13 @@ def _register_renderer() -> None:
 
     @functools.wraps(orig)
     def load_renderer(self, renderer_mode, config, tokenizer):
-        global _serving_ernie5
+        global _serving_ernie5, _renders_response_format
         if config.model_config.hf_config.model_type == ERNIE5_MODEL_TYPE:
             _serving_ernie5 = True
             if renderer_mode == "hf":
                 renderer_mode = ERNIE5_TOKENIZER_MODE
+            if renderer_mode == ERNIE5_TOKENIZER_MODE:
+                _renders_response_format = True
         return orig(self, renderer_mode, config, tokenizer)
 
     load_renderer._ernie5_default_renderer = True  # type: ignore[attr-defined]
@@ -288,6 +293,45 @@ def _patch_enable_thinking() -> None:
         )
 
 
+def _without_non_strict_schema(orig):
+    """Skip the grammar for a ``json_schema`` response format with strict=false.
+
+    vLLM ignores ``strict`` and always constrains decoding. Once the renderer
+    shows the schema to the model, strict=false can follow OpenAI: the model
+    is asked for the schema but not forced into it. Explicit
+    ``structured_outputs`` still apply.
+    """
+    if getattr(orig, "_ernie5_non_strict_schema", False):
+        return orig
+
+    @functools.wraps(orig)
+    def extract_structured_outputs(self):
+        response_format = self.response_format
+        if (
+            _renders_response_format
+            and response_format is not None
+            and response_format.type == "json_schema"
+            and response_format.json_schema is not None
+            and response_format.json_schema.json_schema is not None
+            and response_format.json_schema.strict is False
+        ):
+            return self.structured_outputs
+        return orig(self)
+
+    extract_structured_outputs._ernie5_non_strict_schema = True  # type: ignore[attr-defined]
+    return extract_structured_outputs
+
+
+def _patch_non_strict_schema() -> None:
+    from vllm.entrypoints.openai.chat_completion.protocol import (
+        ChatCompletionRequest,
+    )
+
+    ChatCompletionRequest.extract_structured_outputs = _without_non_strict_schema(
+        ChatCompletionRequest.extract_structured_outputs
+    )
+
+
 _MOONCAKE = "MooncakeConnector"
 
 
@@ -369,4 +413,5 @@ def apply_patches() -> None:
     _register_renderer()
     _patch_parallel_tool_calls()
     _patch_enable_thinking()
+    _patch_non_strict_schema()
     _patch_mooncake_connector()
