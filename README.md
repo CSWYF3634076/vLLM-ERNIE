@@ -218,6 +218,14 @@ cache: there, pass `--gpu-memory-utilization 0.95`, `--max-model-len 65536`,
 `--max-num-seqs 16`, `--max-num-batched-tokens 8192` and
 `--max-cudagraph-capture-size 512` instead.
 
+### **FlashIndexer**
+
+FlashIndexer attaches a lightweight head router to the indexer. For each token the router looks only at that token's own hidden state and selects 8 of the 64 indexer heads for sparse selection, which substantially reduces sparse-indexing computation and keeps the routing cost independent of context length. The DSA interface and the downstream sparse attention are unchanged. The gate weights are read from `<model>/flashindexer/`, and a checkpoint without that subfolder exits at startup. To enable it:
+
+```
+    --hf-overrides '{"enable_flashindexer": true}'
+```
+
 ### 1M Context
 
 The model allows 1,048,576 tokens. Pass `--max-model-len 1048576`; a 1M-token
