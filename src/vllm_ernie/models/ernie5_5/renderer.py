@@ -12,15 +12,10 @@ The Python protocol is used even when the checkpoint also ships
 ``chat_template.jinja``. An explicit ``--chat-template`` (or a trusted request
 ``chat_template``) renders that Jinja through ``HfRenderer`` and HF's own
 ``apply_chat_template``, since ``ErnieChatTokenizer`` rejects template overrides.
-
-Neither protocol renders ``response_format``, so its schema is appended to the
-leading system message on both paths; otherwise the model only meets it as a
-decoding constraint.
 """
 
 import functools
 import inspect
-import json
 from types import MethodType
 from typing import Any
 
@@ -43,58 +38,6 @@ logger = init_logger(__name__)
 
 # Passed by vLLM to every HF chat template, not chat protocol options.
 _SERVING_KWARGS = frozenset({"chat_template", "return_dict", "tokenize", "documents"})
-
-# Appended to the leading system message for a ``response_format`` request.
-_JSON_SCHEMA_PROMPT = (
-    "请只输出一个 JSON 对象，不要输出其他内容，"
-    "JSON 必须符合以下 JSON Schema：\n{schema}"
-)
-_JSON_OBJECT_PROMPT = "请只输出一个 JSON 对象，不要输出其他内容。"
-
-
-def response_format_prompt(response_format: Any) -> str | None:
-    """The system prompt text that shows ``response_format`` to the model."""
-    kind = getattr(response_format, "type", None)
-    if kind == "json_object":
-        return _JSON_OBJECT_PROMPT
-    if kind == "json_schema":
-        json_schema = response_format.json_schema
-        schema = None if json_schema is None else json_schema.json_schema
-        if schema is not None:
-            # Keep the caller's key order: the grammar emits keys in that order,
-            # and equal schemas give equal prompts for the prefix cache.
-            return _JSON_SCHEMA_PROMPT.format(
-                schema=json.dumps(schema, ensure_ascii=False)
-            )
-    return None
-
-
-def _append_text(content: Any, text: str) -> Any:
-    if not content:
-        return text
-    if isinstance(content, str):
-        return content + "\n\n" + text
-    return [*content, {"type": "text", "text": "\n\n" + text}]
-
-
-def with_response_format_prompt(
-    messages: list[ChatCompletionMessageParam], response_format: Any
-) -> list[ChatCompletionMessageParam]:
-    """Return ``messages`` with ``response_format`` in the leading system message.
-
-    The request's own messages are left untouched.
-    """
-    text = response_format_prompt(response_format)
-    if text is None:
-        return messages
-    messages = list(messages)
-    if messages and messages[0].get("role") == "system":
-        first = dict(messages[0])
-        first["content"] = _append_text(first.get("content"), text)
-        messages[0] = first  # type: ignore[assignment]
-    else:
-        messages.insert(0, {"role": "system", "content": text})
-    return messages
 
 
 def uses_python_chat(tokenizer: Any, chat_template: str | None) -> bool:
@@ -205,7 +148,6 @@ class Ernie5_5Renderer(HfRenderer):
         messages: list[ChatCompletionMessageParam],
         params: ChatParams,
     ) -> tuple[list[ConversationMessage], DictPrompt]:
-        messages = with_response_format_prompt(messages, params.response_format)
         if not uses_python_chat(self.tokenizer, params.chat_template):
             return super().render_messages(messages, params)
 
@@ -224,7 +166,6 @@ class Ernie5_5Renderer(HfRenderer):
         messages: list[ChatCompletionMessageParam],
         params: ChatParams,
     ) -> tuple[list[ConversationMessage], DictPrompt]:
-        messages = with_response_format_prompt(messages, params.response_format)
         if not uses_python_chat(self.tokenizer, params.chat_template):
             return await super().render_messages_async(messages, params)
 
