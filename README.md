@@ -11,6 +11,10 @@ checkpoints, with ECHO (MTP) and DSpark speculative decoding, the ERNIE chat
 renderer and the `ernie5` reasoning / tool-call parsers. It runs on
 the released vLLM **0.32.0** wheel, unmodified, on NVIDIA GPUs only.
 
+## News
+
+- [2026/11] vLLM blog: [ERNIE-5.5-Flash-Preview on vLLM](https://vllm.ai/blog/2026-11-24-ernie-5-5-flash-preview)
+
 ## Supported Models
 
 | Model | Weights | Use |
